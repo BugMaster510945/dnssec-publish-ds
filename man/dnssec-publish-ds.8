@@ -1,0 +1,242 @@
+.\" dnssec-publish-ds(8) manual page
+.TH DNSSEC-PUBLISH-DS 8 "May 2026" "dnssec-publish-ds" "System Administration Commands"
+.SH NAME
+dnssec-publish-ds \- DNSSEC DS record publisher daemon
+.SH SYNOPSIS
+.B dnssec-publish-ds
+[\fB\-\-config\fR \fIFILE\fR]
+[\fB\-\-log\-level\fR \fILEVEL\fR]
+[\fB\-\-skip\-initial\-jitter\fR]
+[\fB\-\-dump\-config\fR]
+[\fB\-\-version\fR]
+.SH DESCRIPTION
+.B dnssec-publish-ds
+is a daemon that monitors CDS and CDNSKEY records for configured DNS zones
+and automatically updates DS records at the registrar via provider plugins.
+.PP
+The daemon runs continuously, periodically checking each configured zone
+for alignment between its CDS/CDNSKEY records and the published DS records.
+When a mismatch is detected, the daemon submits an update to the provider
+and polls until the operation completes.
+.PP
+CDNSKEY records are preferred over CDS when both are present.
+DNS responses must be DNSSEC-validated (AD flag set) when possible.
+If no resolver returns AD for CDS/CDNSKEY queries, the daemon falls back
+to a local cryptographic chain validation (DS from parent \(-> DNSKEY \(-> CDS/CDNSKEY).
+.SH OPTIONS
+.TP
+\fB\-\-config\fR \fIFILE\fR
+Path to the TOML configuration file.
+Default: \fI/etc/dnssec-publish-ds/config.toml\fR
+.TP
+\fB\-\-log\-level\fR \fILEVEL\fR
+Set the log level. Valid values: \fBdebug\fR, \fBinfo\fR, \fBwarn\fR, \fBerror\fR.
+Overrides the value set in the configuration file.
+.TP
+\fB\-\-skip\-initial\-jitter\fR
+Bypass the initial randomised startup delay (up to 5 minutes).
+Useful for testing or when starting after a manual restart.
+.TP
+\fB\-\-dump\-config\fR
+Print the fully resolved configuration (after merging conf.d/) as JSON to
+stdout and exit without starting the daemon.
+Useful to verify that secrets were loaded correctly.
+.TP
+\fB\-\-version\fR
+Print the version and exit.
+.TP
+\fB\-\-help\fR
+Print usage information and exit.
+.SH CONFIGURATION
+.SS File format
+The configuration uses TOML format.
+The main file is loaded first, then every \fB.toml\fR file inside a
+\fBconf.d/\fR directory placed next to the main file is merged in
+lexicographic order.
+Because groups are a \fBmap\fR (keyed by group name), conf.d files can
+extend or override individual fields of an existing group without
+repeating all its settings.
+.PP
+Environment variables with the prefix \fBDNSSEC_PUBLISH_DS_\fR override
+any configuration value.
+The variable name is the key path in upper-case with dots and hyphens
+replaced by underscores
+(e.g., \fBDNSSEC_PUBLISH_DS_LOG_LEVEL=debug\fR).
+.SS Global settings
+.TP
+\fBstatus_file\fR \fIstring\fR
+Path to the JSON file used to persist in-progress operation state across
+restarts.
+Default: \fI/var/lib/dnssec-publish-ds/status.json\fR
+.TP
+\fBdns_timeout\fR \fIduration\fR
+Timeout for each DNS query (e.g., \fB5s\fR, \fB2s\fR).
+Default: \fB5s\fR
+.TP
+\fBlog_level\fR \fIstring\fR
+Log verbosity.  One of \fBdebug\fR, \fBinfo\fR, \fBwarn\fR, \fBerror\fR.
+Default: \fBinfo\fR
+.SS Group settings
+Each group is defined under \fB[group.\fIname\fB]\fR where \fIname\fR is
+an arbitrary identifier for the group.
+Multiple groups can be declared in the same file or spread across conf.d
+files; they are merged by name.
+.TP
+\fBplugin\fR \fIstring\fR (required)
+Name of the provider plugin to use (e.g., \fBovh\-v1\fR).
+.TP
+\fBcheck_interval\fR \fIduration\fR
+How often the daemon checks zone alignment when idle.
+Default: \fB12h\fR
+.TP
+\fBerror_retry_interval\fR \fIduration\fR
+How long the daemon waits before retrying after a DNS or API error.
+Default: \fB5m\fR
+.TP
+\fBzones\fR \fIarray of strings\fR (required)
+List of DNS zone names managed by this group.
+Each zone must appear in at most one group.
+.TP
+\fBplugin_config\fR \fItable\fR (required)
+Plugin-specific credentials and settings.
+See the \fBPLUGINS\fR section below.
+.SS Example: main file with one group
+.nf
+status_file = "/var/lib/dnssec-publish-ds/status.json"
+log_level   = "info"
+
+[group.ovh-main]
+plugin               = "ovh-v1"
+check_interval       = "12h"
+error_retry_interval = "5m"
+zones                = ["example.com", "example.org"]
+
+[plugins."ovh-v1"]
+max_concurrency    = 1
+
+[group.ovh-main.plugin_config]
+endpoint           = "ovh-eu"
+application_key    = "AK..."
+application_secret = "AS..."
+consumer_key       = "CK..."
+.fi
+.SS Example: splitting groups and secrets across conf.d/
+.nf
+# conf.d/10-groups.toml
+[plugins."ovh-v1"]
+max_concurrency = 1
+
+[group.ovh-main]
+plugin = "ovh-v1"
+zones  = ["example.com"]
+
+# conf.d/20-secrets.toml  (gitignored)
+[group.ovh-main.plugin_config]
+endpoint           = "ovh-eu"
+application_key    = "AK..."
+application_secret = "AS..."
+consumer_key       = "CK..."
+.fi
+.SH PLUGINS
+.SS ovh-v1
+Manages DS records for domains registered at OVH via the OVH API v1.
+.PP
+Upon initialisation the plugin calls \fBGET /me\fR to verify that the
+credentials are valid and logs the NIC handle of the authenticated account.
+.PP
+.B plugin_config parameters:
+.TP
+\fBendpoint\fR \fIstring\fR
+OVH API endpoint.  Common values: \fBovh-eu\fR (Europe), \fBovh-ca\fR
+(Canada), \fBovh-us\fR (United States).
+Default: \fBovh-eu\fR
+.TP
+\fBapplication_key\fR \fIstring\fR (required)
+OVH application key.
+.TP
+\fBapplication_secret\fR \fIstring\fR (required)
+OVH application secret.
+.TP
+\fBconsumer_key\fR \fIstring\fR (required)
+OVH consumer key (token bound to a specific NIC handle and set of
+permissions).
+.TP
+.B Global plugin parameters (\fR[plugins."ovh-v1"]\fB):
+.TP
+\fBmax_concurrency\fR \fIinteger\fR
+Global concurrency limit for OVH API calls shared by all \fBovh-v1\fR
+instances in the process.  Must be placed in the \fB[plugins."ovh-v1"]\fR
+section, not in a group's \fBplugin_config\fR.
+Default: \fB1\fR
+.PP
+.B OVH API routes required:
+.TS
+l l.
+GET/me
+GET/domain/{zone}/task
+GET/domain/{zone}/dsRecord
+GET/domain/{zone}/dsRecord/{id}
+POST/domain/{zone}/dsRecord
+GET/domain/{zone}/task/{taskId}
+POST/domain/{zone}/task/{taskId}/accelerate
+.TE
+.PP
+.B Operation flow:
+.IP 1.
+Submit: \fBPOST /domain/{zone}/dsRecord\fR with the desired key set.
+.IP 2.
+Accelerate: as soon as \fBcanAccelerate\fR becomes true on the resulting
+task, call \fBPOST /domain/{zone}/task/{taskId}/accelerate\fR to skip the
+24-hour propagation wait.
+.IP 3.
+Wait: poll the task every 30 s until its status is \fBdone\fR, \fBerror\fR,
+\fBproblem\fR, or \fBcancelled\fR.
+.SH FILES
+.TP
+\fI/etc/dnssec-publish-ds/config.toml\fR
+Main configuration file.
+.TP
+\fI/etc/dnssec-publish-ds/conf.d/\fR
+Supplementary configuration files loaded in lexicographic order and merged
+into the main configuration.
+.TP
+\fI/var/lib/dnssec-publish-ds/status.json\fR
+Persistent state file.  Records in-progress operations so that the daemon
+can resume after a restart without re-submitting already-pending tasks.
+.SH SIGNALS
+.TP
+\fBSIGHUP\fR
+Reload configuration.  The daemon saves its current state, stops all
+zone runners, reloads the configuration, and restarts cleanly.
+.TP
+\fBSIGTERM\fR, \fBSIGINT\fR
+Graceful shutdown.  In-progress state is saved to the status file before
+exiting so that pending operations can be resumed on next start.
+.SH EXIT STATUS
+.TP
+\fB0\fR
+Normal termination.
+.TP
+\fB1\fR
+Fatal error (invalid configuration, plugin initialisation failure, etc.).
+.SH ENVIRONMENT
+.TP
+\fBDNSSEC_PUBLISH_DS_LOG_LEVEL\fR
+Override \fBlog_level\fR.
+.TP
+\fBDNSSEC_PUBLISH_DS_STATUS_FILE\fR
+Override \fBstatus_file\fR.
+.TP
+\fBDNSSEC_PUBLISH_DS_DNS_TIMEOUT\fR
+Override \fBdns_timeout\fR.
+.TP
+\fBDNSSEC_PUBLISH_DS_GROUP_\fIGROUPNAME\fB_PLUGIN_CONFIG_APPLICATION_KEY\fR
+Override \fBapplication_key\fR for the named group (replace hyphens in
+the group name with underscores and use upper-case).
+Likewise for \fBAPPLICATION_SECRET\fR, \fBCONSUMER_KEY\fR, and
+\fBENDPOINT\fR.
+.SH SEE ALSO
+.BR systemctl (1),
+.BR journalctl (1)
+.SH AUTHORS
+planchon <planchon@syshawk.com>

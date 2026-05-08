@@ -1,0 +1,31 @@
+[Unit]
+Description=DNSSEC DS record publisher daemon
+Documentation=man:dnssec-publish-ds(8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dnssec-publish-ds
+Group=dnssec-publish-ds
+ExecStart=/usr/sbin/dnssec-publish-ds --config /etc/dnssec-publish-ds/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=30s
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Security hardening
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/dnssec-publish-ds
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dnssec-publish-ds
+
+[Install]
+WantedBy=multi-user.target

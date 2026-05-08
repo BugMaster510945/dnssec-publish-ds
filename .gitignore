@@ -1,0 +1,22 @@
+# Go build artifacts
+/dnssec-publish-ds
+/dnssec-publish-ds-linux-amd64
+/dnssec-publish-ds-linux-arm64
+
+# Generated shell completions
+/completions/
+
+# Generated manpage archive
+/man/*.gz
+
+# Debian helper/generated files
+debian/debhelper-build-stamp
+debian/dnssec-publish-ds/
+debian/*.debhelper
+debian/*.debhelper.log
+debian/*.substvars
+debian/files
+debian/.debhelper/
+
+.output
+_build
