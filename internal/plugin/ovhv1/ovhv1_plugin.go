@@ -80,6 +80,12 @@ func (p *OVHv1Plugin) NewGroup(groupName string, cfg map[string]any) (plugin.Gro
 	}
 	client.Logger = ovhSlogLogger{log: groupPlugin.logger().With("component", "ovh_http")}
 
+	allowAccel := true
+	if v, ok := cfg["allow_acceleration"].(bool); ok {
+		allowAccel = v
+	}
+	groupPlugin.allowAcceleration = allowAccel
+
 	if err := groupPlugin.checkCredentials(context.Background()); err != nil {
 		return nil, err
 	}

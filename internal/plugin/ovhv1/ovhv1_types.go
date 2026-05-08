@@ -10,10 +10,7 @@ import (
 
 const pluginName = "ovh-v1"
 
-const (
-	stateDSSubmitted = "ds_submitted"
-	stateAccelerated = "accelerated"
-)
+// No longer needed - states are simplified
 
 // OVHv1Plugin is the global plugin object for OVH v1.
 type OVHv1Plugin struct {
@@ -23,9 +20,10 @@ type OVHv1Plugin struct {
 
 // OVHv1Group is the group-specific OVH plugin instance.
 type OVHv1Group struct {
-	plugin *OVHv1Plugin
-	client *ovh.Client
-	log    *slog.Logger
+	plugin            *OVHv1Plugin
+	client            *ovh.Client
+	log               *slog.Logger
+	allowAcceleration bool
 }
 
 // ovhKey is the representation of a DNSSEC key in the OVH API.

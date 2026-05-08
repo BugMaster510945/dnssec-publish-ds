@@ -37,18 +37,47 @@ func (p *OVHv1Group) checkCredentials(ctx context.Context) error {
 
 func (p *OVHv1Group) Update(ctx context.Context, req plugin.UpdateRequest) (plugin.UpdateResult, error) {
 	zone := strings.TrimSuffix(req.Zone, ".")
+
+	// First call - find or create task
 	if len(req.Raw) == 0 {
 		return p.startUpdate(ctx, zone, req)
 	}
 
-	switch rawState(req.Raw) {
-	case stateDSSubmitted:
-		return p.updateDSSubmitted(ctx, zone, req.Raw)
-	case stateAccelerated:
-		return p.updateAccelerated(ctx, zone, req.Raw)
-	default:
-		return plugin.UpdateResult{}, fmt.Errorf("unknown OVH raw state %q for %s", rawState(req.Raw), zone)
+	// Resume - manage existing task
+	taskID, err := rawTaskID(req.Raw)
+	if err != nil {
+		return plugin.UpdateResult{}, err
 	}
+
+	task, err := p.getTask(ctx, zone, taskID)
+	if err != nil {
+		return plugin.UpdateResult{}, err
+	}
+
+	// Check if finished
+	if done, result, err := finishedTaskResult(taskID, task.Status); done {
+		return result, err
+	}
+
+	// Accelerate if possible AND allowed
+	if task.CanAccelerate && p.allowAcceleration {
+		if err := p.accelerate(ctx, zone, taskID); err != nil {
+			p.logger().Warn("failed to accelerate task", "task_id", taskID, "error", err)
+		}
+		// Sleep a bit after acceleration
+		return plugin.UpdateResult{
+			InProgress: true,
+			Raw:        buildRaw(taskID),
+			NextWait:   5 * time.Second,
+		}, nil
+	}
+
+	// Continue normally
+	return plugin.UpdateResult{
+		InProgress: true,
+		Raw:        buildRaw(taskID),
+		NextWait:   30 * time.Second,
+	}, nil
 }
 
 func (p *OVHv1Group) startUpdate(ctx context.Context, zone string, req plugin.UpdateRequest) (plugin.UpdateResult, error) {
@@ -131,58 +160,8 @@ func (p *OVHv1Group) submitUpdate(ctx context.Context, zone string, req plugin.U
 	// response: OVH may not make acceleration available immediately after creation.
 	return plugin.UpdateResult{
 		InProgress: true,
-		Raw:        buildRaw(strconv.Itoa(task.ID), task.Status, stateDSSubmitted),
+		Raw:        buildRaw(strconv.Itoa(task.ID)),
 		NextWait:   5 * time.Second,
-	}, nil
-}
-
-func (p *OVHv1Group) updateDSSubmitted(ctx context.Context, zone string, raw map[string]any) (plugin.UpdateResult, error) {
-	taskID, err := rawTaskID(raw)
-	if err != nil {
-		return plugin.UpdateResult{}, err
-	}
-
-	task, err := p.getTask(ctx, zone, taskID)
-	if err != nil {
-		return plugin.UpdateResult{}, err
-	}
-
-	if done, result, err := finishedTaskResult(taskID, task.Status); done {
-		return result, err
-	}
-
-	if task.CanAccelerate {
-		if err := p.accelerate(ctx, zone, taskID); err != nil {
-			p.logger().Warn("failed to accelerate task", "task_id", taskID, "error", err)
-		}
-	}
-
-	return plugin.UpdateResult{
-		InProgress: true,
-		Raw:        buildRaw(taskID, task.Status, stateAccelerated),
-		NextWait:   5 * time.Second,
-	}, nil
-}
-
-func (p *OVHv1Group) updateAccelerated(ctx context.Context, zone string, raw map[string]any) (plugin.UpdateResult, error) {
-	taskID, err := rawTaskID(raw)
-	if err != nil {
-		return plugin.UpdateResult{}, err
-	}
-
-	task, err := p.getTask(ctx, zone, taskID)
-	if err != nil {
-		return plugin.UpdateResult{}, err
-	}
-
-	if done, result, err := finishedTaskResult(taskID, task.Status); done {
-		return result, err
-	}
-
-	return plugin.UpdateResult{
-		InProgress: true,
-		Raw:        buildRaw(taskID, task.Status, stateAccelerated),
-		NextWait:   30 * time.Second,
 	}, nil
 }
 

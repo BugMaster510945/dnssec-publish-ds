@@ -12,7 +12,7 @@ import (
 func runningTaskResult(task ovhTask) plugin.UpdateResult {
 	return plugin.UpdateResult{
 		InProgress: true,
-		Raw:        buildRaw(strconv.Itoa(task.ID), task.Status, taskState(task)),
+		Raw:        buildRaw(strconv.Itoa(task.ID)),
 	}
 }
 
@@ -27,18 +27,9 @@ func finishedTaskResult(taskID string, status string) (bool, plugin.UpdateResult
 	}
 }
 
-func taskState(task ovhTask) string {
-	if task.CanAccelerate {
-		return stateDSSubmitted
-	}
-	return stateAccelerated
-}
-
-func buildRaw(taskID string, status string, state string) map[string]any {
+func buildRaw(taskID string) map[string]any {
 	return map[string]any{
 		"task_id": taskID,
-		"status":  status,
-		"state":   state,
 	}
 }
 
@@ -48,11 +39,6 @@ func rawTaskID(raw map[string]any) (string, error) {
 		return "", fmt.Errorf("missing task_id in OVH raw state")
 	}
 	return taskID, nil
-}
-
-func rawState(raw map[string]any) string {
-	state, _ := raw["state"].(string)
-	return state
 }
 
 func canonicalOVHKey(key ovhKey) string {

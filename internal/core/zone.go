@@ -59,10 +59,10 @@ func NewZoneRunner(group, zone string, checkInterval, errorRetryInterval time.Du
 // Run starts the zone state machine. It blocks until the context is cancelled.
 func (z *ZoneRunner) Run(ctx context.Context) {
 	if z.skipInitialJitter {
-		z.log.Debug("initial sleep bypassed")
+		z.log.Info("initial sleep bypassed")
 	} else {
 		jitter := time.Duration(rand.Int64N(int64(initialJitterMax)))
-		z.log.Debug("initial sleep before first check", "jitter", jitter)
+		z.log.Info("initial sleep before first check", "jitter", jitter)
 		if !z.sleep(ctx, jitter) {
 			return
 		}
@@ -229,7 +229,7 @@ func (z *ZoneRunner) sleepForInterval(ctx context.Context, interval time.Duratio
 	if ctx.Err() != nil {
 		return false
 	}
-	z.log.Debug("sleeping", "interval", interval)
+	z.log.Info("sleeping", "interval", interval)
 	return z.sleep(ctx, interval)
 }
 

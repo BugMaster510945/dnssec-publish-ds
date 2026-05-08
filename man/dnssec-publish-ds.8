@@ -161,6 +161,11 @@ OVH application secret.
 OVH consumer key (token bound to a specific NIC handle and set of
 permissions).
 .TP
+\fBallow_acceleration\fR \fIboolean\fR
+Allow the daemon to call the acceleration endpoint to skip the 24-hour
+propagation wait when available.
+Default: \fBtrue\fR
+.TP
 .B Global plugin parameters (\fR[plugins."ovh-v1"]\fB):
 .TP
 \fBmax_concurrency\fR \fIinteger\fR
