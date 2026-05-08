@@ -42,7 +42,41 @@ func (p *OVHv1Plugin) Init(globalCfg map[string]any, logger *slog.Logger) error 
 	}
 
 	p.throttle = throttle
+
+	waitSubmit, err := plugin.ParseDurationOption(globalCfg, "wait_submit", defaultWaitSubmit)
+	if err != nil {
+		return fmt.Errorf("%s: %w", pluginName, err)
+	}
+	if waitSubmit <= 0 {
+		return fmt.Errorf("%s: wait_submit must be greater than zero", pluginName)
+	}
+
+	waitPollUrgent, err := plugin.ParseDurationOption(globalCfg, "wait_poll_urgent", defaultWaitPollUrgent)
+	if err != nil {
+		return fmt.Errorf("%s: %w", pluginName, err)
+	}
+	if waitPollUrgent <= 0 {
+		return fmt.Errorf("%s: wait_poll_urgent must be greater than zero", pluginName)
+	}
+
+	waitPollPassive, err := plugin.ParseDurationOption(globalCfg, "wait_poll_passive", defaultWaitPollPassive)
+	if err != nil {
+		return fmt.Errorf("%s: %w", pluginName, err)
+	}
+	if waitPollPassive <= 0 {
+		return fmt.Errorf("%s: wait_poll_passive must be greater than zero", pluginName)
+	}
+
+	p.waitSubmit = waitSubmit
+	p.waitPollUrgent = waitPollUrgent
+	p.waitPollPassive = waitPollPassive
+
 	p.logger().Info("configured ovh api throttling", "max_concurrency", maxConcurrency)
+	p.logger().Info("configured ovh wait policy",
+		"wait_submit", p.waitSubmit,
+		"wait_poll_urgent", p.waitPollUrgent,
+		"wait_poll_passive", p.waitPollPassive,
+	)
 	return nil
 }
 
@@ -50,6 +84,30 @@ func (p *OVHv1Plugin) NewGroup(groupName string, cfg map[string]any) (plugin.Gro
 	if _, ok := cfg["max_concurrency"]; ok {
 		return nil, fmt.Errorf(
 			"%s: max_concurrency must be configured in [plugins.\"%s\"], not in [group.%s.plugin_config]",
+			pluginName,
+			pluginName,
+			groupName,
+		)
+	}
+	if _, ok := cfg["wait_submit"]; ok {
+		return nil, fmt.Errorf(
+			"%s: wait_submit must be configured in [plugins.\"%s\"], not in [group.%s.plugin_config]",
+			pluginName,
+			pluginName,
+			groupName,
+		)
+	}
+	if _, ok := cfg["wait_poll_urgent"]; ok {
+		return nil, fmt.Errorf(
+			"%s: wait_poll_urgent must be configured in [plugins.\"%s\"], not in [group.%s.plugin_config]",
+			pluginName,
+			pluginName,
+			groupName,
+		)
+	}
+	if _, ok := cfg["wait_poll_passive"]; ok {
+		return nil, fmt.Errorf(
+			"%s: wait_poll_passive must be configured in [plugins.\"%s\"], not in [group.%s.plugin_config]",
 			pluginName,
 			pluginName,
 			groupName,

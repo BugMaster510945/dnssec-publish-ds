@@ -173,6 +173,23 @@ Global concurrency limit for OVH API calls shared by all \fBovh-v1\fR
 instances in the process.  Must be placed in the \fB[plugins."ovh-v1"]\fR
 section, not in a group's \fBplugin_config\fR.
 Default: \fB1\fR
+.TP
+\fBwait_submit\fR \fIduration\fR
+Wait delay after submitting a DS update task.
+Must be placed in \fB[plugins."ovh-v1"]\fR (not in group plugin_config).
+Default: \fB30s\fR
+.TP
+\fBwait_poll_urgent\fR \fIduration\fR
+Polling delay for urgent follow-up checks.
+Used when task is not accelerable or acceleration is allowed.
+Must be placed in \fB[plugins."ovh-v1"]\fR (not in group plugin_config).
+Default: \fB30s\fR
+.TP
+\fBwait_poll_passive\fR \fIduration\fR
+Polling delay for non-urgent follow-up checks.
+Used when task is accelerable but \fBallow_acceleration\fR is disabled.
+Must be placed in \fB[plugins."ovh-v1"]\fR (not in group plugin_config).
+Default: \fB5m\fR
 .PP
 .B OVH API routes required:
 .TS
@@ -190,11 +207,12 @@ POST/domain/{zone}/task/{taskId}/accelerate
 .IP 1.
 Submit: \fBPOST /domain/{zone}/dsRecord\fR with the desired key set.
 .IP 2.
-Accelerate: as soon as \fBcanAccelerate\fR becomes true on the resulting
-task, call \fBPOST /domain/{zone}/task/{taskId}/accelerate\fR to skip the
-24-hour propagation wait.
+Accelerate: when \fBcanAccelerate\fR is true and \fBallow_acceleration\fR is
+enabled, call \fBPOST /domain/{zone}/task/{taskId}/accelerate\fR.
 .IP 3.
-Wait: poll the task every 30 s until its status is \fBdone\fR, \fBerror\fR,
+Wait: poll every \fBwait_poll_urgent\fR (default 30 s) in urgent paths, and
+every \fBwait_poll_passive\fR (default 5 m) when task is accelerable but
+acceleration is disabled. Continue until status is \fBdone\fR, \fBerror\fR,
 \fBproblem\fR, or \fBcancelled\fR.
 .SH FILES
 .TP

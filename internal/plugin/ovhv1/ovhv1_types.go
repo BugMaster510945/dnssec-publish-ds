@@ -2,6 +2,7 @@ package ovhv1
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/ovh/go-ovh/ovh"
 
@@ -10,12 +11,21 @@ import (
 
 const pluginName = "ovh-v1"
 
+const (
+	defaultWaitSubmit      = 30 * time.Second
+	defaultWaitPollUrgent  = 30 * time.Second
+	defaultWaitPollPassive = 5 * time.Minute
+)
+
 // No longer needed - states are simplified
 
 // OVHv1Plugin is the global plugin object for OVH v1.
 type OVHv1Plugin struct {
-	log      *slog.Logger
-	throttle *plugin.Limiter
+	log             *slog.Logger
+	throttle        *plugin.Limiter
+	waitSubmit      time.Duration
+	waitPollUrgent  time.Duration
+	waitPollPassive time.Duration
 }
 
 // OVHv1Group is the group-specific OVH plugin instance.

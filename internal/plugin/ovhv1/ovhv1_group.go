@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"gitlab.syshawk.com/planchon/dnssec-publish-ds/internal/plugin"
 )
@@ -59,16 +58,22 @@ func (p *OVHv1Group) Update(ctx context.Context, req plugin.UpdateRequest) (plug
 		return result, err
 	}
 
-	// Accelerate if possible AND allowed
-	if task.CanAccelerate && p.allowAcceleration {
-		if err := p.accelerate(ctx, zone, taskID); err != nil {
-			p.logger().Warn("failed to accelerate task", "task_id", taskID, "error", err)
+	if task.CanAccelerate {
+		if p.allowAcceleration {
+			if err := p.accelerate(ctx, zone, taskID); err != nil {
+				p.logger().Warn("failed to accelerate task", "task_id", taskID, "error", err)
+			}
+			return plugin.UpdateResult{
+				InProgress: true,
+				Raw:        buildRaw(taskID),
+				NextWait:   p.plugin.waitPollUrgent,
+			}, nil
 		}
-		// Sleep a bit after acceleration
+
 		return plugin.UpdateResult{
 			InProgress: true,
 			Raw:        buildRaw(taskID),
-			NextWait:   5 * time.Second,
+			NextWait:   p.plugin.waitPollPassive,
 		}, nil
 	}
 
@@ -76,7 +81,7 @@ func (p *OVHv1Group) Update(ctx context.Context, req plugin.UpdateRequest) (plug
 	return plugin.UpdateResult{
 		InProgress: true,
 		Raw:        buildRaw(taskID),
-		NextWait:   30 * time.Second,
+		NextWait:   p.plugin.waitPollUrgent,
 	}, nil
 }
 
@@ -156,12 +161,11 @@ func (p *OVHv1Group) submitUpdate(ctx context.Context, zone string, req plugin.U
 		return plugin.UpdateResult{}, fmt.Errorf("posting DS update for %s: %w", zone, err)
 	}
 
-	// Always start in ds_submitted state regardless of canAccelerate in the POST
-	// response: OVH may not make acceleration available immediately after creation.
+	// Keep polling after submit; acceleration availability may appear asynchronously.
 	return plugin.UpdateResult{
 		InProgress: true,
 		Raw:        buildRaw(strconv.Itoa(task.ID)),
-		NextWait:   5 * time.Second,
+		NextWait:   p.plugin.waitSubmit,
 	}, nil
 }
 

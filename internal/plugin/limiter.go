@@ -117,3 +117,25 @@ func ParseIntOption(cfg map[string]any, key string, defaultValue int) (int, erro
 		return 0, fmt.Errorf("unsupported %s type %T", key, value)
 	}
 }
+
+// ParseDurationOption reads an optional duration option from a config map.
+// Missing or nil values return defaultValue.
+func ParseDurationOption(cfg map[string]any, key string, defaultValue time.Duration) (time.Duration, error) {
+	value, ok := cfg[key]
+	if !ok || value == nil {
+		return defaultValue, nil
+	}
+
+	switch typed := value.(type) {
+	case time.Duration:
+		return typed, nil
+	case string:
+		parsed, err := time.ParseDuration(typed)
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s %q: %w", key, typed, err)
+		}
+		return parsed, nil
+	default:
+		return 0, fmt.Errorf("unsupported %s type %T", key, value)
+	}
+}

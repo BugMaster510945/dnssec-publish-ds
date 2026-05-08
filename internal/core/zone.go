@@ -84,11 +84,7 @@ func (z *ZoneRunner) runStep(ctx context.Context) (time.Duration, bool) {
 	state := z.loadOwnedState()
 	req, active, err := z.prepareUpdateRequest(state)
 	if err != nil {
-		interval := z.errorRetryInterval
-		if active {
-			interval = defaultPollInterval
-		}
-		return interval, ctx.Err() == nil
+		return z.errorRetryInterval, ctx.Err() == nil
 	}
 
 	if req == nil {
@@ -102,11 +98,7 @@ func (z *ZoneRunner) runStep(ctx context.Context) (time.Duration, bool) {
 		} else {
 			z.log.Error("failed to submit update", "error", err)
 		}
-		interval := z.errorRetryInterval
-		if active {
-			interval = defaultPollInterval
-		}
-		return interval, ctx.Err() == nil
+		return z.errorRetryInterval, ctx.Err() == nil
 	}
 
 	sleepFor := z.applyUpdateResult(result)
