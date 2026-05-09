@@ -102,9 +102,6 @@ func (z *ZoneRunner) runStep(ctx context.Context) (time.Duration, bool) {
 	}
 
 	sleepFor := z.applyUpdateResult(result)
-	if !result.InProgress && (active || req.Raw == nil) {
-		z.runVerify(ctx)
-	}
 	return sleepFor, ctx.Err() == nil
 }
 
@@ -223,33 +220,6 @@ func (z *ZoneRunner) sleepForInterval(ctx context.Context, interval time.Duratio
 	}
 	z.log.Info("sleeping", "interval", interval)
 	return z.sleep(ctx, interval)
-}
-
-// runVerify re-queries DNS to confirm DS records are now aligned.
-func (z *ZoneRunner) runVerify(ctx context.Context) {
-	z.log.Info("verifying DS alignment after update")
-
-	desiredKeys, _, err := z.dns.FetchZoneKeys(z.zone)
-	if err != nil {
-		z.log.Warn("verification failed: cannot fetch zone keys", "error", err)
-		return
-	}
-
-	currentDS, err := z.dns.QueryDS(z.zone)
-	if err != nil {
-		z.log.Warn("verification failed: cannot query DS", "error", err)
-		return
-	}
-
-	toAdd, toRemove := CompareDS(currentDS, desiredKeys)
-	if len(toAdd) == 0 && len(toRemove) == 0 {
-		z.log.Info("verification passed: zone is now aligned")
-	} else {
-		z.log.Warn("verification failed: zone is still misaligned",
-			"remaining_add", len(toAdd),
-			"remaining_remove", len(toRemove),
-		)
-	}
 }
 
 // sleep waits for the given duration or until the context is cancelled.

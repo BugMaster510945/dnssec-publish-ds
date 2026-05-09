@@ -14,7 +14,7 @@ const pluginName = "ovh-v1"
 const (
 	defaultWaitSubmit      = 30 * time.Second
 	defaultWaitPollUrgent  = 30 * time.Second
-	defaultWaitPollPassive = 5 * time.Minute
+	defaultWaitPollPassive = 30 * time.Minute
 )
 
 // No longer needed - states are simplified

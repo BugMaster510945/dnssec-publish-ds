@@ -52,6 +52,11 @@ func (p *OVHv1Group) Update(ctx context.Context, req plugin.UpdateRequest) (plug
 	if err != nil {
 		return plugin.UpdateResult{}, err
 	}
+	p.logger().Info("ovh task polled",
+		"task_id", taskID,
+		"status", task.Status,
+		"can_accelerate", task.CanAccelerate,
+	)
 
 	// Check if finished
 	if done, result, err := finishedTaskResult(taskID, task.Status); done {

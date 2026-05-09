@@ -189,7 +189,7 @@ Default: \fB30s\fR
 Polling delay for non-urgent follow-up checks.
 Used when task is accelerable but \fBallow_acceleration\fR is disabled.
 Must be placed in \fB[plugins."ovh-v1"]\fR (not in group plugin_config).
-Default: \fB5m\fR
+Default: \fB30m\fR
 .PP
 .B OVH API routes required:
 .TS
@@ -211,7 +211,7 @@ Accelerate: when \fBcanAccelerate\fR is true and \fBallow_acceleration\fR is
 enabled, call \fBPOST /domain/{zone}/task/{taskId}/accelerate\fR.
 .IP 3.
 Wait: poll every \fBwait_poll_urgent\fR (default 30 s) in urgent paths, and
-every \fBwait_poll_passive\fR (default 5 m) when task is accelerable but
+every \fBwait_poll_passive\fR (default 30 m) when task is accelerable but
 acceleration is disabled. Continue until status is \fBdone\fR, \fBerror\fR,
 \fBproblem\fR, or \fBcancelled\fR.
 .SH FILES
