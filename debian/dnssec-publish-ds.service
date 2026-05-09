@@ -3,6 +3,8 @@ Description=DNSSEC DS record publisher daemon
 Documentation=man:dnssec-publish-ds(8)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -12,8 +14,6 @@ ExecStart=/usr/sbin/dnssec-publish-ds --config /etc/dnssec-publish-ds/config.tom
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=30s
-StartLimitIntervalSec=600
-StartLimitBurst=5
 
 # Security hardening
 ProtectSystem=full

@@ -25,6 +25,12 @@ func Setup(level string) {
 
 	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: lvl,
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.Attr{}
+			}
+			return a
+		},
 	})
 	slog.SetDefault(slog.New(handler))
 }

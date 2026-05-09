@@ -259,7 +259,7 @@ func (c *DNSClient) validateDNSSECChain(zone string) ([]plugin.KeyRecord, bool, 
 	if hasCDS {
 		for _, c := range cdsRecords {
 			if c.Algorithm == 0 {
-				slog.Info("DNSSEC fallback: zone requests DNSSEC removal (sentinel CDS)", "zone", zone)
+				slog.Debug("DNSSEC fallback: zone requests DNSSEC removal (sentinel CDS)", "zone", zone)
 				return nil, true, nil
 			}
 		}
@@ -267,7 +267,7 @@ func (c *DNSClient) validateDNSSECChain(zone string) ([]plugin.KeyRecord, bool, 
 	if hasCDNSKEY {
 		for _, k := range cdnskeys {
 			if k.Algorithm == 0 {
-				slog.Info("DNSSEC fallback: zone requests DNSSEC removal (sentinel CDNSKEY)", "zone", zone)
+				slog.Debug("DNSSEC fallback: zone requests DNSSEC removal (sentinel CDNSKEY)", "zone", zone)
 				return nil, true, nil
 			}
 		}
@@ -279,14 +279,14 @@ func (c *DNSClient) validateDNSSECChain(zone string) ([]plugin.KeyRecord, bool, 
 		if len(records) == 0 {
 			return nil, false, fmt.Errorf("CDNSKEY records found but produced no valid key records (fallback chain validation) for zone %s", zone)
 		}
-		slog.Info("DNSSEC fallback: validation succeeded using local chain", "zone", zone, "method", "fallback_chain_validation")
+		slog.Debug("DNSSEC fallback: validation succeeded using local chain", "zone", zone, "method", "fallback_chain_validation")
 		return records, false, nil
 	}
 	records := buildFromCDS(cdsRecords)
 	if len(records) == 0 {
 		return nil, false, fmt.Errorf("CDS records found but produced no valid key records (fallback chain validation) for zone %s", zone)
 	}
-	slog.Info("DNSSEC fallback: validation succeeded using local chain", "zone", zone, "method", "fallback_chain_validation")
+	slog.Debug("DNSSEC fallback: validation succeeded using local chain", "zone", zone, "method", "fallback_chain_validation")
 	return records, false, nil
 }
 

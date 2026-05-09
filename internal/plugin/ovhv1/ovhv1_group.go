@@ -54,6 +54,7 @@ func (p *OVHv1Group) Update(ctx context.Context, req plugin.UpdateRequest) (plug
 		return plugin.UpdateResult{}, err
 	}
 	p.logger().Info("ovh task polled",
+		"zone", zone,
 		"task_id", taskID,
 		"status", task.Status,
 		"can_accelerate", task.CanAccelerate,
@@ -68,7 +69,7 @@ func (p *OVHv1Group) Update(ctx context.Context, req plugin.UpdateRequest) (plug
 	if task.CanAccelerate {
 		if p.allowAcceleration {
 			if err := p.accelerate(ctx, zone, taskID); err != nil {
-				p.logger().Warn("failed to accelerate task", "task_id", taskID, "error", err)
+				p.logger().Warn("failed to accelerate task", "zone", zone, "task_id", taskID, "error", err)
 			}
 			return plugin.UpdateResult{
 				InProgress: true,
