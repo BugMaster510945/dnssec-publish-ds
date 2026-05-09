@@ -14,7 +14,7 @@ const pluginName = "ovh-v1"
 const (
 	defaultWaitSubmit      = 30 * time.Second
 	defaultWaitPollUrgent  = 30 * time.Second
-	defaultWaitPollPassive = 30 * time.Minute
+	defaultWaitPollPassive = 5 * time.Minute
 )
 
 // No longer needed - states are simplified
@@ -53,12 +53,13 @@ type ovhDSPayload struct {
 
 // ovhTask represents an OVH domain task.
 type ovhTask struct {
-	ID            int    `json:"id"`
-	Function      string `json:"function"`
-	Status        string `json:"status"`
-	CanAccelerate bool   `json:"canAccelerate"`
-	CanCancel     bool   `json:"canCancel"`
-	CanRelaunch   bool   `json:"canRelaunch"`
+	ID            int        `json:"id"`
+	Function      string     `json:"function"`
+	Status        string     `json:"status"`
+	TodoDate      *time.Time `json:"todoDate"`
+	CanAccelerate bool       `json:"canAccelerate"`
+	CanCancel     bool       `json:"canCancel"`
+	CanRelaunch   bool       `json:"canRelaunch"`
 }
 
 // ovhMe is the subset of /me fields we care about.

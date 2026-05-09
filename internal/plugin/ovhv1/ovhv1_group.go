@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"gitlab.syshawk.com/planchon/dnssec-publish-ds/internal/plugin"
 )
@@ -56,6 +57,7 @@ func (p *OVHv1Group) Update(ctx context.Context, req plugin.UpdateRequest) (plug
 		"task_id", taskID,
 		"status", task.Status,
 		"can_accelerate", task.CanAccelerate,
+		"todo_date", task.TodoDate,
 	)
 
 	// Check if finished
@@ -73,6 +75,17 @@ func (p *OVHv1Group) Update(ctx context.Context, req plugin.UpdateRequest) (plug
 				Raw:        buildRaw(taskID),
 				NextWait:   p.plugin.waitPollUrgent,
 			}, nil
+		}
+
+		if task.TodoDate != nil {
+			nextFromTodo := time.Until(task.TodoDate.Add(p.plugin.waitPollPassive))
+			if nextFromTodo > 0 {
+				return plugin.UpdateResult{
+					InProgress: true,
+					Raw:        buildRaw(taskID),
+					NextWait:   nextFromTodo,
+				}, nil
+			}
 		}
 
 		return plugin.UpdateResult{

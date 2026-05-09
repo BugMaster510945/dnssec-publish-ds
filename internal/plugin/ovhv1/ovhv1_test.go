@@ -1,10 +1,12 @@
 package ovhv1
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"gitlab.syshawk.com/planchon/dnssec-publish-ds/internal/plugin"
 )
@@ -108,5 +110,20 @@ func TestBuildDesiredKeysDetectsChanges(t *testing.T) {
 	}
 	if added != 1 || removed != 1 {
 		t.Fatalf("expected added=1 removed=1, got added=%d removed=%d", added, removed)
+	}
+}
+
+func TestOVHTaskTodoDateUnmarshal(t *testing.T) {
+	var task ovhTask
+	err := json.Unmarshal([]byte(`{"id":1,"function":"ZoneDnssecDsCreate","status":"todo","todoDate":"2026-05-09T06:53:55.272Z","canAccelerate":true,"canCancel":false,"canRelaunch":false}`), &task)
+	if err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+	if task.TodoDate == nil {
+		t.Fatal("expected todoDate to be populated")
+	}
+	expected := time.Date(2026, 5, 9, 6, 53, 55, 272000000, time.UTC)
+	if !task.TodoDate.Equal(expected) {
+		t.Fatalf("unexpected todoDate: %v", task.TodoDate)
 	}
 }
