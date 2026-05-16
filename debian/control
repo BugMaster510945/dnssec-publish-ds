@@ -1,7 +1,7 @@
 Source: dnssec-publish-ds
 Section: net
 Priority: optional
-Maintainer: planchon <planchon@syshawk.com>
+Maintainer: Frédéric Planchon <syshawk@planchon.org>
 Build-Depends: debhelper-compat (= 13),
  dh-golang,
  golang-any (>= 2:1.24~),
@@ -15,7 +15,7 @@ XS-Go-Import-Path: gitlab.syshawk.com/planchon/dnssec-publish-ds
 
 Package: dnssec-publish-ds
 Architecture: any
-Depends: ${misc:Depends}, adduser, init-system-helpers (>= 1.54~)
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser, init-system-helpers (>= 1.54~)
 Static-Built-Using: ${misc:Static-Built-Using}
 Suggests: bash-completion
 Description: DNSSEC DS record publisher daemon
@@ -23,3 +23,12 @@ Description: DNSSEC DS record publisher daemon
  updates DS records at the registrar via provider plugins.
  .
  Currently supports OVH API v1 as a provider.
+
+Package: xymon-ext-dnssec
+Architecture: all
+Depends: ${misc:Depends}, perl, hobbit-plugins, libnet-dns-perl, libnet-dns-sec-perl, libyaml-tiny-perl
+Recommends: xymon
+Description: Xymon server extension for DNSSEC zone checks
+ Perl probe for Xymon server ext to validate DNSSEC chain health for zones.
+ It verifies parent DS to zone DNSKEY consistency, signature validity windows,
+ NSEC3 recommendation, and CDS/CDNSKEY presence policy.

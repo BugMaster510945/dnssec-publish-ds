@@ -1,5 +1,6 @@
 GOFLAGS         := -trimpath
 BINARY          := dnssec-publish-ds
+PROBE           := xymon-ext-dnssec
 PKG_FLAGS       ?=
 GO              ?= go
 COMPLETIONS_DIR := completions
@@ -39,6 +40,7 @@ completions: build
 man:
 	@mkdir -p man
 	gzip -kf man/$(BINARY).8
+	gzip -kf man/$(PROBE).1
 
 package-deb:
 	dpkg-buildpackage -us -uc -b $(PKG_FLAGS)
@@ -46,4 +48,4 @@ package-deb:
 clean:
 	rm -f $(BINARY) $(BINARY)-linux-amd64 $(BINARY)-linux-arm64
 	rm -rf $(COMPLETIONS_DIR)
-	rm -f man/$(BINARY).8.gz
+	rm -f man/$(BINARY).8.gz man/$(PROBE).1.gz

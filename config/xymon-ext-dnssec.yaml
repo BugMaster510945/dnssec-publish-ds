@@ -1,0 +1,45 @@
+# Global configuration for xymon-ext-dnssec.
+
+# Optionnal xymon probe name
+# test_name: dnssec
+
+# Optional hosts.cfg location
+# hosts_cfg: /etc/xymon/hosts.cfg
+
+# Optional resolver timeout in seconds.
+# resolver_timeout: 5
+
+# Optional recursive resolver override list.
+# nameservers:
+#   - 192.0.2.53
+#   - 2001:db8::53
+
+# Allow-lists for crypto policy.
+# allowed_algorithms:
+#   - RSASHA256
+#   - RSASHA512
+#   - ECDSAP256SHA256
+#   - ECDSAP384SHA384
+#   - ED25519
+#   - ED448
+
+# Configuration per zone
+
+# Default NSEC3 expectation.
+# zone_warn_if_no_nsec3: true
+
+# Policy when both CDS and CDNSKEY are absent for a zone.
+# zone_require_permanent_cds_cdnskey: true
+
+# Way to determine parent zone name for a given zone
+# zone_parent_strip_labels: 1
+
+# Server specific settings (reserved for TSIG/SIG(0) support).
+# Keys are server name or "default".
+# server_options:
+#   default: {}
+#   example.net:
+#     tsig:
+#       name: tsig_name
+#       algorithm: hmac-sha512
+#       secret: base64-secret==

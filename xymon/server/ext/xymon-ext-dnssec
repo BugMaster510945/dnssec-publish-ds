@@ -1,0 +1,1070 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(GetOptions);
+use Hobbit;
+use Net::DNS;
+use Net::DNS::RR::DNSKEY;
+use Net::DNS::SEC;
+use YAML::Tiny;
+use Storable qw(dclone);
+
+# Package Guard permet d'emuler le defer en go
+{ package Guard; sub new { bless \$_[1], $_[0] } sub DESTROY { ${$_[0]}->() } }
+
+my %DEFAULTS = (
+    resolver_timeout    => 5,
+    zone_warn_if_no_nsec3 => 1,
+    zone_require_permanent_cds_cdnskey => 1,
+    zone_parent_strip_labels => 1,
+    allowed_algorithms  => [ 'RSASHA256', 'RSASHA512', 'ECDSAP256SHA256', 'ECDSAP384SHA384', 'ED25519', 'ED448' ],
+    config_file         => '/etc/xymon/xymon-ext-dnssec.yaml',
+    test_name           => 'dnssec',
+    nameservers         => [],
+    hosts_cfg           => '',
+    server_options      => {},
+);
+
+sub main {
+    my @cli_zones;
+    my $config_path = $DEFAULTS{config_file};
+    my $hosts_cfg_override;
+    my $debug = 0;
+    my $debug_dns = 0;
+
+    GetOptions(
+        'zone=s@'     => \@cli_zones,
+        'config=s'    => \$config_path,
+        'hosts-cfg=s' => \$hosts_cfg_override,
+        'debug!'      => \$debug,
+        'debug-dns!'  => \$debug_dns,
+    ) or die "Invalid arguments\n";
+
+    push @cli_zones, @ARGV;
+
+    my $cfg = load_probe_config($config_path);
+    if (defined $hosts_cfg_override && $hosts_cfg_override ne q{}) {
+        $cfg->{hosts_cfg} = $hosts_cfg_override;
+        $ENV{HOSTSCFG} = $hosts_cfg_override;
+    }
+
+    # xymongrep reads HOSTSCFG from environment; keep config fallback for local runs.
+    if ((!defined $ENV{HOSTSCFG} || $ENV{HOSTSCFG} eq q{}) && defined $cfg->{hosts_cfg} && $cfg->{hosts_cfg} ne q{}) {
+        $ENV{HOSTSCFG} = $cfg->{hosts_cfg};
+    }
+
+    my $zone_entries = collect_zone_names($cfg, \@cli_zones);
+
+    if (!@$zone_entries) {
+        return 0;
+    }
+
+    my $recursive = build_recursive_resolver($cfg, $debug_dns);
+
+    for my $entry (@$zone_entries) {
+        my %ctx;
+        my $bb = new Hobbit({ test => $cfg->{test_name}, hostname => $entry->{zone} });
+
+        $ctx{zone} = $entry->{zone};
+        $ctx{bb} = $bb;
+        $ctx{recursive} = $recursive;
+        $ctx{cfg} = merge_zone_options($cfg, $entry->{options});
+        $ctx{debug} = $debug;
+        $ctx{debug_dns} = $debug_dns;
+
+        $bb->print("Zone: $ctx{zone}\n");
+        {
+            my $zone_options = $entry->{options};
+            debug(\%ctx, "Zone options: %s", !keys %$zone_options ? 'none' : join(',', map { "$_=$zone_options->{$_}" } sort keys %$zone_options));
+        }
+        $bb->print("\n");
+
+        run_zone_checks(\%ctx);
+        $bb->send();
+    }
+
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# Step 1: Load config
+# ---------------------------------------------------------------------------
+
+sub load_probe_config {
+    my ($path) = @_;
+
+    my %cfg = %DEFAULTS;
+    if (defined $path && $path ne q{} && -f $path) {
+        my $yaml = YAML::Tiny->read($path);
+        if ($yaml && $yaml->[0] && ref $yaml->[0] eq 'HASH') {
+            $cfg{$_} = $yaml->[0]->{$_} for keys %{ $yaml->[0] };
+        }
+    }
+
+    $cfg{resolver_timeout}    = int($cfg{resolver_timeout});
+    $cfg{zone_warn_if_no_nsec3} = parse_bool_option_value($cfg{zone_warn_if_no_nsec3});
+    $cfg{zone_require_permanent_cds_cdnskey} = parse_bool_option_value($cfg{zone_require_permanent_cds_cdnskey});
+    $cfg{zone_parent_strip_labels} = int($cfg{zone_parent_strip_labels});
+
+    $cfg{nameservers} = [] if ref $cfg{nameservers} ne 'ARRAY';
+    $cfg{server_options} = {} if ref $cfg{server_options} ne 'HASH';
+
+    $cfg{allowed_algorithms} = $DEFAULTS{allowed_algorithms}
+        if ref $cfg{allowed_algorithms} ne 'ARRAY';
+
+    $cfg{allowed_algorithms} = normalize_allowed_algorithms($cfg{allowed_algorithms});
+    # Calcul de la map des algos autorisés une seule fois dans la config fusionnée
+    $cfg{allowed_algorithms_map} = { map { $_ => 1 } @{ $cfg{allowed_algorithms} } };
+
+    return \%cfg;
+}
+
+# ---------------------------------------------------------------------------
+# Step 2: Load zones from hosts.cfg and CLI
+# ---------------------------------------------------------------------------
+
+sub collect_zone_names {
+    my ($cfg, $cli_zones) = @_;
+
+    my @entries;
+    my %seen;
+
+    my $xymongrep = "/usr/lib/xymon/client/bin/xymongrep";
+    $xymongrep = "$ENV{XYMONHOME}/bin/xymongrep" if defined $ENV{XYMONHOME} && $ENV{XYMONHOME} ne q{};
+    die sprintf('xymongrep not executable: %s', $xymongrep) if !-x $xymongrep;
+
+    open my $fh, '-|', $xymongrep, 'dnssec', 'dnssec='
+        or die sprintf('cannot run xymongrep (%s): %s', $xymongrep, $!);
+
+    while (my $line = <$fh>) {
+        next if $line !~ /^(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+#\s+(.*)$/;
+        my ($ipv4, $host, $services) = ($1, $2, $3);
+
+        my $zone = normalize_zone_input($host);
+        next if !defined $zone;
+
+        my $has_dnssec = 0;
+        my $opts = {};
+
+        for my $service (split /\s+/, $services) {
+            next if $service eq q{};
+
+            if (lc($service) eq 'dnssec') {
+                $has_dnssec = 1;
+                next;
+            }
+
+            if ($service =~ /^dnssec(?:=(.*))?$/i) {
+                $has_dnssec = 1;
+                $opts = parse_zone_options($1);
+            }
+        }
+
+        next if !$has_dnssec;
+        next if $seen{$zone}++;
+
+        push @entries, { zone => $zone, options => $opts || {} };
+    }
+    close $fh;
+
+    for my $z (@{$cli_zones || []}) {
+        my $norm = normalize_zone_input($z);
+        next if !defined $norm;
+        next if $seen{$norm}++;
+        push @entries, { zone => $norm, options => {} };
+    }
+
+    return \@entries;
+}
+
+sub parse_zone_options {
+    my ($raw) = @_;
+    return {} if !defined $raw || $raw eq q{};
+
+    my %opts;
+    for my $item (split /,/, lc($raw)) {
+        $item =~ s/^\s+|\s+$//g;
+        next if $item eq q{};
+
+        my ($k, $v) = ($item, 1);
+        if ($item =~ /^([^:]+):(.+)$/) {
+            ($k, $v) = ($1, $2);
+        }
+
+
+        $k = 'require_permanent_cds_cdnskey' if $k eq 'permanent_cds_cdnskey';
+        $v = parse_bool_option_value($v) if $k eq 'require_permanent_cds_cdnskey';
+
+        if($k eq 'no_permanent_cds_cdnskey') {
+            $k = 'require_permanent_cds_cdnskey';
+            $v = !parse_bool_option_value($v);
+        }
+
+        $k = 'parent_strip_labels' if $k eq 'strip';
+        $v = int($v) if $k eq 'parent_strip_labels';
+
+        $k = 'warn_if_no_nsec3' if $k eq 'nsec3';
+        $v = parse_bool_option_value($v) if $k eq 'warn_if_no_nsec3';
+        if($k eq 'nsec') {
+            $k = 'warn_if_no_nsec3';
+            $v = !parse_bool_option_value($v);
+        }
+
+        $opts{$k} = $v;
+    }
+
+    return \%opts;
+}
+
+# ---------------------------------------------------------------------------
+# Step 3: Zone processing loop
+# ---------------------------------------------------------------------------
+
+sub run_zone_checks {
+    my ($ctx) = @_;
+
+    # --- Phase 1: Compute parent zone ---
+    my ($parent_zone, $parent_zone_err) = compute_parent_zone($ctx);
+    return if( check_error($ctx, $parent_zone_err, "Cannot determine parent zone: %s", $parent_zone_err) );
+    debug($ctx, "Computed parent zone: %s", $parent_zone);
+    $ctx->{parent_zone} = $parent_zone;
+
+    # --- Phase 2: Discover parent NS ---
+    my ($parent_ips, $parent_ips_err) = discover_parent_ns($ctx, $parent_zone);
+    return if( check_error($ctx, $parent_ips_err, "Parent NS discovery failed: %s", $parent_ips_err) );
+    debug($ctx, "Parent NS: %d IP(s)", scalar @$parent_ips);
+
+    # --- Phase 3: Fetch delegation from parent ---
+    my ($delegation, $delegation_err) = fetch_delegation_from_parent($ctx, $parent_ips);
+    return if( check_error($ctx, $delegation_err, "Delegation query failed: %s", $delegation_err) );
+    return if( check_error($ctx, !@{$delegation->{ds_rrs}}, "No DS at parent zone (%s): zone not in DNSSEC chain", $parent_zone) );
+    $ctx->{parent_delegation} = $delegation;
+
+    # --- Phase 4: Check DS from parent for unsupported algorithms ---
+    check_parent_ds_algorithms($ctx, $delegation->{ds_rrs});
+
+    # --- Phase 5: Build zone NS list ---
+    my $ns_list = build_zone_ns_list($ctx);
+    return if( check_error($ctx, !@$ns_list, "No NS found in delegation for %s", $ctx->{zone}) );
+    bbprint($ctx, ""); # Saute une ligne
+
+    my $ns_passed = 0;
+    my $ns_total  = 0;
+    # --- Phase 6: Advanced tests on each NS ---
+    for my $ns (sort { lc($a->{hostname}) cmp lc($b->{hostname}) } @$ns_list) {
+        my $name = $ns->{hostname};
+        my $ips  = $ns->{ips} || [];
+        my @defer;
+
+        bbprint($ctx, "%s (%s)", $name, join(', ', @$ips));
+        push @defer, Guard->new(sub { bbprint($ctx, ""); }); # Saute une ligne
+        next if( check_error($ctx, !@$ips, "No resolved IPs for NS %s", $name) );
+
+        my ($data, $data_err) = fetch_zone_state_from_server($ctx, $name, $ips);
+        next if check_error($ctx, $data_err, "Failed to fetch zone state from %s: %s", $name, $data_err);
+
+        $ns_total++;
+        $ns_passed++ if run_ns_checks($ctx, $ns, $data);
+    }
+
+    if ($ns_total > 0 && $ns_passed == 0) {
+        color_line($ctx, 'red', "No DNS server is fully compliant");
+    }
+}
+
+# ---------------------------------------------------------------------------
+# DNS lookups and model
+# ---------------------------------------------------------------------------
+
+sub build_recursive_resolver {
+    my ($cfg, $debug) = @_;
+
+    my $r = Net::DNS::Resolver->new;
+    $r->dnssec(1);
+    $r->recurse(1);
+    $r->udp_timeout($cfg->{resolver_timeout});
+    $r->tcp_timeout($cfg->{resolver_timeout});
+    $r->retrans($cfg->{resolver_timeout});
+    $r->retry(1);
+    $r->defnames(0);
+    $r->dnsrch(0);    
+    $r->searchlist('');
+    $r->debug($debug);
+    $r->nameservers(@{ $cfg->{nameservers} }) if @{ $cfg->{nameservers} || [] };
+
+    return $r;
+}
+
+sub build_authoritative_resolver {
+    my ($ctx, $server_ips, $server_name) = @_;
+
+    my $r = Net::DNS::Resolver->new;
+    $r->dnssec(1);
+    $r->recurse(0);
+    $r->udp_timeout($ctx->{cfg}->{resolver_timeout});
+    $r->tcp_timeout($ctx->{cfg}->{resolver_timeout});
+    $r->retrans($ctx->{cfg}->{resolver_timeout});
+    $r->retry(1);
+    $r->defnames(0);
+    $r->dnsrch(0);    
+    $r->searchlist('');
+    $r->debug($ctx->{debug_dns});
+    $r->nameservers(@$server_ips);
+
+    my $server_options = server_options_for($ctx, $server_name);
+
+    # Ajout TSIG si défini dans les options
+    if ($server_options && ref $server_options eq 'HASH' && $server_options->{tsig}) {
+        my $tsig = $server_options->{tsig};
+        if ($tsig->{name} && $tsig->{secret}) {
+            # Vilain hack pour affecter la variable de tsig car tsig() ne fait le job qu'avec un fichier
+            $r->{tsig_rr} = 
+                Net::DNS::RR->new(
+                    type      => 'TSIG',
+                    name      => $tsig->{name},
+                    algorithm => $tsig->{algorithm} || 'hmac-sha256',
+                    key       => $tsig->{secret},
+                )
+            ;
+        }
+    }
+
+    return $r;
+}
+
+sub query_rrset {
+    my ($ctx, $resolver, $name, $type, $require_ad) = @_;
+
+    my $packet = $resolver->send($name, $type, 'IN');
+    if (!$packet) {
+        return (undef, [], sprintf('DNS query %s %s failed: %s', $name, $type, $resolver->errorstring || 'unknown error'));
+    }
+
+    my $rcode = $packet->header->rcode;
+    if ($rcode ne 'NOERROR') {
+        return ($packet, [], sprintf('DNS query %s %s returned rcode=%s', $name, $type, $rcode));
+    }
+
+    warn_error($ctx, $require_ad && !$packet->header->ad, "DNS query %s %s does not have AD flag", $name, $type);
+   
+    my @rrs = grep { $_->type eq $type } $packet->answer;
+    return ($packet, \@rrs, undef);
+}
+
+sub resolve_host_ips {
+    my ($ctx, $resolver, $host_fqdn) = @_;
+
+    my @ips;
+    my %seen;
+
+    for my $type ('A', 'AAAA') {
+        my (undef, $rrs, $err) = query_rrset($ctx, $resolver, $host_fqdn, $type);
+        next if $err;
+        for my $rr (@$rrs) {
+            my $ip = $rr->address;
+            next if !$ip || $seen{$ip}++;
+            push @ips, $ip;
+        }
+    }
+
+    return \@ips;
+}
+
+sub fetch_zone_state_from_server {
+    my ($ctx, $server_name, $server_ips) = @_;
+    my $server_ip_label = join(',', @$server_ips);
+
+    my $resolver = build_authoritative_resolver($ctx, $server_ips, $server_name);
+
+    my ($soa_packet, $soa_rrs, $soa_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'SOA');
+    return (undef, sprintf('SOA failed on %s (%s): %s', $server_name, $server_ip_label, $soa_err)) if $soa_err;
+    return (undef, sprintf('SOA empty on %s (%s)', $server_name, $server_ip_label)) if !@$soa_rrs;
+
+    my ($ns_packet, $ns_rrs, $ns_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'NS');
+    return (undef, sprintf('NS failed on %s (%s): %s', $server_name, $server_ip_label, $ns_err)) if $ns_err;
+    return (undef, sprintf('NS empty on %s (%s)', $server_name, $server_ip_label)) if !@$ns_rrs;
+
+    my ($dnskey_packet, $dnskey_rrs, $dnskey_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'DNSKEY');
+    return (undef, sprintf('DNSKEY failed on %s (%s): %s', $server_name, $server_ip_label, $dnskey_err)) if $dnskey_err;
+    return (undef, sprintf('DNSKEY empty on %s (%s)', $server_name, $server_ip_label)) if !@$dnskey_rrs;
+
+    my ($cds_packet, $cds_rrs, $cds_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'CDS');
+    warn_error($ctx, $cds_err, "CDS query failed on %s (%s): %s", $server_name, $server_ip_label, $cds_err);
+    my ($cdns_packet, $cdns_rrs, $cdns_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'CDNSKEY');
+    warn_error($ctx, $cdns_err, "CDNSKEY query failed on %s (%s): %s", $server_name, $server_ip_label, $cdns_err);
+    my ($n3_packet, $n3_rrs, $n3_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'NSEC3PARAM');
+    warn_error($ctx, $n3_err, "NSEC3PARAM query failed on %s (%s): %s", $server_name, $server_ip_label, $n3_err);
+
+    my $state = {
+        server_name   => $server_name,
+        server_ip     => $server_ip_label,
+        server_ips    => $server_ips,
+        soa_packet    => $soa_packet,
+        soa_rrs       => $soa_rrs,
+        soa_mname     => lc($soa_rrs->[0]->mname),
+        soa_serial    => $soa_rrs->[0]->serial,
+        ns_packet     => $ns_packet,
+        ns_rrs        => $ns_rrs,
+        dnskey_packet => $dnskey_packet,
+        dnskey_rrs    => $dnskey_rrs,
+        cds_packet    => $cds_packet,
+        cds_rrs       => $cds_rrs || [],
+        cdns_packet   => $cdns_packet,
+        cdns_rrs      => $cdns_rrs || [],
+        n3_packet     => $n3_packet,
+        n3_rrs        => $n3_rrs || [],
+    };
+
+    return ($state, undef);
+}
+
+# ---------------------------------------------------------------------------
+# Parent NS discovery and zone delegation
+# ---------------------------------------------------------------------------
+
+sub is_in_zone {
+    my ($hostname, $zone_fqdn) = @_;
+    my $h = lc($hostname);
+    my $z = lc($zone_fqdn);
+    return $h eq $z || $h =~ /\.\Q$z\E$/;
+}
+
+sub compute_parent_zone {
+    my ($ctx) = @_;
+
+    my $strip = $ctx->{cfg}->{zone_parent_strip_labels} // 1;
+    my $zone = $ctx->{zone};
+
+    my @labels = split /\./, $zone;
+    if (@labels <= $strip) {
+        return (undef, sprintf('zone "%s" has %d label(s), cannot strip %d to find parent',
+            $zone, scalar @labels, $strip));
+    }
+
+    my @parent_labels = @labels[$strip .. $#labels];
+    return (join('.', @parent_labels), undef);
+}
+
+sub discover_parent_ns {
+    my ($ctx, $parent) = @_;
+
+    my ($packet, $ns_rrs, $err) = query_rrset($ctx, $ctx->{recursive}, $parent, 'NS', 1);
+    return (undef, "NS query for parent zone $parent failed: $err") if $err;
+    return (undef, "No NS records found for parent zone $parent") if !@$ns_rrs;
+       
+    # Build IP map from additional section
+    my %additional_ips;
+    for my $rr ($packet->additional) {
+        next unless $rr->type eq 'A' || $rr->type eq 'AAAA';
+        my $host = lc($rr->name);
+        $host =~ s/\.+$//;
+        push @{ $additional_ips{$host} }, $rr->address;
+    }
+
+    # Collect all parent NS IPs (additional first, then fallback resolve)
+    my @all_ips;
+    for my $ns (@$ns_rrs) {
+        my $host = lc($ns->nsdname);
+        $host =~ s/\.+$//;
+        if (exists $additional_ips{$host} && @{ $additional_ips{$host} }) {
+            push @all_ips, @{ $additional_ips{$host} };
+        } else {
+            my $resolved = resolve_host_ips($ctx, $ctx->{recursive}, $host);
+            push @all_ips, @$resolved;
+        }
+    }
+
+    return \@all_ips;
+}
+
+sub fetch_delegation_from_parent {
+    my ($ctx, $parent_ips) = @_;
+
+    my $resolver = build_authoritative_resolver($ctx, $parent_ips, $ctx->{parent_zone});
+
+    # NS delegation: check answer then authority section
+    my ($ds_packet, $ds_rrs, $ds_err);
+    my ($ns_packet, $ns_rrs, $ns_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'NS');
+    return (undef, $ns_err) if $ns_err;    
+
+    my @ns_rrs = grep { $_->type eq 'NS' } ($ns_packet->answer, $ns_packet->authority);
+    return (undef, "No NS delegation records found for $ctx->{zone}") if (!@ns_rrs);
+
+    # Keep all additional IPs in hints_map; glue_map only marks in-zone NS.
+    my (%glue_map, %hints_map);
+    for my $rr ($ns_packet->additional) {
+        next unless $rr->type eq 'A' || $rr->type eq 'AAAA';
+        my $owner = lc($rr->name);
+        push @{ $hints_map{$owner} }, $rr->address;
+        if (is_in_zone($owner, $ctx->{zone})) {
+            push @{ $glue_map{$owner} }, $rr->address;
+        }
+    }
+
+    # Limit DNS request if parent provide directly DS.
+    my @ds_rrs = grep { $_->type eq 'DS' } ($ns_packet->answer, $ns_packet->authority);
+    if( !@ds_rrs ) {
+        # DS records from parent
+        ($ds_packet, $ds_rrs, $ds_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'DS');
+        return (undef, $ds_err) if $ds_err;
+    }
+
+    return ({
+        ns_rrs    => \@ns_rrs,
+        ds_rrs    => $ds_rrs // \@ds_rrs,
+        glue_map  => \%glue_map,
+        hints_map => \%hints_map,
+    }, undef);
+}
+
+sub build_zone_ns_list {
+    my ($ctx) = @_;
+
+    my @ns_list;
+    my %seen;
+    for my $ns (sort { lc($a->nsdname) cmp lc($b->nsdname) } @{$ctx->{parent_delegation}->{ns_rrs}}) {
+        my @ips;
+        my $host = lc($ns->nsdname);
+        next if $seen{$host}++;
+
+        if (exists $ctx->{parent_delegation}->{hints_map}->{$host} && @{ $ctx->{parent_delegation}->{hints_map}->{$host} }) {
+            @ips = @{ $ctx->{parent_delegation}->{hints_map}->{$host} };
+        } else {
+            my $resolved = resolve_host_ips($ctx, $ctx->{recursive}, $host);
+            @ips = @$resolved;
+        }
+        debug($ctx, "Parent delegation NS %s has IPs: %s (glue=%s)", $host, join(',', @ips), exists $ctx->{parent_delegation}->{glue_map}->{$host} ? 'yes' : 'no');
+
+        push @ns_list, { hostname => $host, ips => \@ips, is_glue => (exists $ctx->{parent_delegation}->{glue_map}->{$host} ? 1 : 0) };
+    }
+
+    return \@ns_list;
+}
+
+sub parse_bool_option_value {
+    my ($value) = @_;
+    return undef if !defined $value;
+    my $v = lc($value);
+    $v =~ s/^\s+|\s+$//g;
+    return 1 if $v =~ /^(1|true|yes|on)$/;
+    return 0 if $v =~ /^(0|false|no|off)$/;
+    return undef;
+}
+
+# ---------------------------------------------------------------------------
+# Policy mapping helpers
+# ---------------------------------------------------------------------------
+
+sub normalize_allowed_algorithms {
+    my ($values) = @_;
+
+    my @out;
+    my %seen;
+    for my $v (@{ $values || [] }) {
+        my $id;
+        if ($v =~ /^\d+$/) {
+            $id = int($v);
+        } else {
+            $id = eval { Net::DNS::RR::DNSKEY->algorithm($v) };
+        }
+        next if !defined $id || $id !~ /^\d+$/;
+        next if $seen{$id}++;
+        push @out, int($id);
+    }
+
+    return \@out;
+}
+
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
+
+sub server_options_for {
+    my ($ctx, $server_name) = @_;
+
+    return {} if ref $ctx->{cfg}->{server_options} ne 'HASH';
+
+    my $key = lc($server_name || q{});
+
+    return $ctx->{cfg}->{server_options}->{$key} if exists $ctx->{cfg}->{server_options}->{$key};
+    return $ctx->{cfg}->{server_options}->{default} if exists $ctx->{cfg}->{server_options}->{default};
+    return {};
+}
+
+sub normalize_zone_input {
+    my ($z) = @_;
+    return undef if !defined $z;
+    $z =~ s/^\s+|\s+$//g;
+    $z =~ s/[;,]+$//;
+    $z =~ s/\.+$//;
+    return undef if $z eq q{};
+    return lc($z);
+}
+
+# ---------------------------------------------------------------------------
+# Fusion utilitaire des options globales et spécifiques zone
+# ---------------------------------------------------------------------------
+sub merge_zone_options {
+    my ($cfg, $zone_options) = @_;
+    # Deep clone de tout $cfg
+    my %merged = %{ dclone($cfg) };
+    # Override : chaque clé de zone_options devient zone_<clé> dans le merged
+    if (defined $zone_options && ref $zone_options eq 'HASH') {
+        for my $k (keys %$zone_options) {
+            $merged{"zone_$k"} = $zone_options->{$k};
+        }
+    }
+    return \%merged;
+}
+
+sub debug {
+    my ($ctx, $fmt, @args) = @_;
+    return unless $ctx && ref $ctx eq 'HASH' && $ctx->{debug};
+    bbprint(@_);
+}
+
+sub bbprint {
+    my ($ctx, $fmt, @args) = @_;
+    my $bb = $ctx->{bb};
+    return unless $bb;
+    $bb->sprintf($fmt . "\n", @args);
+}
+
+sub check_error {
+    my ($ctx, $err, $fmt, @args) = @_;
+    return $err unless $ctx && ref $ctx eq 'HASH';
+    return $err unless $err;
+    color_line($ctx, 'red', $fmt, @args);
+    return $err;
+}
+
+sub warn_error {
+    my ($ctx, $err, $fmt, @args) = @_;
+    return $err unless $ctx && ref $ctx eq 'HASH';
+    return $err unless $err;
+    color_line($ctx, 'yellow', $fmt, @args);
+    return $err;
+}
+
+sub color_line {
+    my ($ctx, $color, $fmt, @args) = @_;
+    return unless $ctx && ref $ctx eq 'HASH';
+    my $bb = $ctx->{bb};
+    return unless $bb;
+    $bb->color_line($color, sprintf($fmt . "\n", @args));
+    return;
+}
+
+# ---------------------------------------------------------------------------
+# Parent DS algorithm policy check (centralisée)
+# ---------------------------------------------------------------------------
+sub check_parent_ds_algorithms {
+    my ($ctx, $ds_rrs) = @_;
+    my $allowed = $ctx->{cfg}->{allowed_algorithms_map};
+    for my $ds (@$ds_rrs) {
+        my $algo = $ds->algorithm;
+        my $algo_str = Net::DNS::RR::DNSKEY->algorithm($algo) || $algo;
+        my $keytag = $ds->keytag;
+        if ($allowed->{$algo}) {
+            color_line($ctx, 'green', "Parent DS keytag=%d algo=%d(%s)", $keytag, $algo, $algo_str);
+        } else {
+            color_line($ctx, 'yellow', "Parent DS keytag=%d algo=%d(%s): NOT allowed", $keytag, $algo, $algo_str);
+        }
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+# NS checks: Phase 2 — Helper RRSIG central
+# ---------------------------------------------------------------------------
+
+# Vérifie les RRSIG d'un RRset donné : présence, crypto, expiry et chaîne de confiance.
+#
+# $require_ksk_signer = 1 : le signataire doit être une KSK référencée dans les DS
+#                           (usage : DNSKEY, CDS, CDNSKEY)
+# $require_ksk_signer = 0 : le signataire peut être KSK ou ZSK, mais :
+#                           - KSK → doit être dans les DS
+#                           - ZSK → la zone doit avoir au moins une KSK dans les DS
+#                           (usage : SOA, NS, ...)
+#
+# Les DS parent sont déduits de $ctx->{parent_delegation}{ds_rrs}.
+# %dnskey_by_tag et %ksks_in_ds sont précalculés par check_ds_dnskey_bidirectional
+# et stockés dans $data->{_dnskey_by_tag} / $data->{_ksks_in_ds}.
+# Retourne 1 si tout est OK, 0 si au moins un problème.
+sub check_rrsig_on_rrset {
+    my ($ctx, $rrtype, $packet, $rrset_rrs, $data, $require_ksk_signer) = @_;
+    return 1 unless defined $packet;
+
+    my $ok = 1;
+    my @rrsigs = grep { $_->type eq 'RRSIG' && uc($_->typecovered) eq uc($rrtype) } $packet->answer;
+
+    if (!@rrsigs) {
+        # on Fait un bbprint au lieu d'un color_line car un fail su 1 serveur c'est pas dramatique
+        $ctx->{bb}->add_color('yellow');
+        bbprint($ctx, "&red No RRSIG found for %s", $rrtype);
+        return 0;
+    }
+
+    my $dnskey_by_tag = $data->{_dnskey_by_tag} || {};
+    my $ksks_in_ds    = $data->{_ksks_in_ds}    || {};
+    my $now = time();
+
+    for my $rrsig (@rrsigs) {
+        my $keytag = $rrsig->keytag;
+        my $signer = $dnskey_by_tag->{$keytag};
+
+        # 1. Le signataire doit exister dans le DNSKEY set
+        if (!$signer) {
+            $ctx->{bb}->add_color('yellow');
+            bbprint($ctx, "&red RRSIG(%s) keytag=%d references unknown DNSKEY", $rrtype, $keytag);
+            $ok = 0;
+            next;
+        }
+
+        # 2. Validation cryptographique
+        my $valid = eval { $rrsig->verify($rrset_rrs, $signer) };
+        if ($@) {
+            $ctx->{bb}->add_color('yellow');
+            bbprint($ctx, "&red RRSIG(%s) keytag=%d crypto error: %s", $rrtype, $keytag, $@);
+            $ok = 0;
+            next;
+        }
+        if (!$valid) {
+            $ctx->{bb}->add_color('yellow');
+            bbprint($ctx, "&red RRSIG(%s) keytag=%d signature invalid", $rrtype, $keytag);
+            $ok = 0;
+            next;
+        }
+
+        # 3. Expiration imminente : now + TTL > sigexpiration → le cache peut distribuer une sig expirée
+        my $ttl        = ($rrset_rrs && @$rrset_rrs) ? $rrset_rrs->[0]->ttl : 0;
+        my $expiration = $rrsig->sigexpiration;
+        if ($now + $ttl > $expiration) {
+            color_line($ctx, 'yellow', "RRSIG(%s) keytag=%d expires in %ds (< TTL %ds): imminent expiry",
+                $rrtype, $keytag, $expiration - $now, $ttl);
+            $ok = 0;
+        }
+
+        # 4. Validation de la chaîne de confiance par keytag
+        my $is_ksk = ($signer->flags & 0x0101) == 0x0101;
+
+        if ($require_ksk_signer) {
+            # DNSKEY/CDS/CDNSKEY : le signataire doit être une KSK référencée dans les DS
+            if (!$is_ksk) {
+                color_line($ctx, 'yellow', "RRSIG(%s) keytag=%d: signer is not a KSK", $rrtype, $keytag);
+                $ok = 0;
+            } elsif (!$ksks_in_ds->{$keytag}) {
+                color_line($ctx, 'yellow', "RRSIG(%s) keytag=%d: KSK not covered by any DS", $rrtype, $keytag);
+                $ok = 0;
+            } else {
+                debug($ctx, "RRSIG(%s) keytag=%d: signed by KSK in DS, valid, expires in %ds",
+                    $rrtype, $keytag, $expiration - $now);
+            }
+        } else {
+            # SOA/NS/... : KSK ou ZSK accepté
+            if ($is_ksk) {
+                # KSK doit être dans les DS
+                if (!$ksks_in_ds->{$keytag}) {
+                    color_line($ctx, 'yellow', "RRSIG(%s) keytag=%d: KSK not covered by any DS", $rrtype, $keytag);
+                    $ok = 0;
+                } else {
+                    debug($ctx, "RRSIG(%s) keytag=%d: signed by KSK in DS, valid, expires in %ds",
+                        $rrtype, $keytag, $expiration - $now);
+                }
+            } else {
+                # ZSK : la zone doit avoir au moins une KSK dans les DS (chaîne indirecte)
+                # La ZSK est deja validé par un signer KSK grace a la validation des DNSKEY (RRSIG)
+                # et la présence de toutes les DNSKEY dans dnskey_by_tag
+                if (!%$ksks_in_ds) {
+                    color_line($ctx, 'yellow',
+                        "RRSIG(%s) keytag=%d: signed by ZSK but no trusted KSK found in zone",
+                        $rrtype, $keytag);
+                    $ok = 0;
+                } else {
+                    debug($ctx, "RRSIG(%s) keytag=%d: signed by ZSK, trusted via KSK chain, valid, expires in %ds",
+                        $rrtype, $keytag, $expiration - $now);
+                }
+            }
+        }
+    }
+
+    return $ok;
+}
+
+sub check_ds_dnskey_bidirectional {
+    my ($ctx, $data) = @_;
+    my $ok = 1;
+
+    my $ds_rrs      = $ctx->{parent_delegation}->{ds_rrs} || [];
+    my $dnskey_rrs  = $data->{dnskey_rrs} || [];
+    my $allowed_alg = $ctx->{cfg}->{allowed_algorithms_map} || {};
+
+    my @ksks = grep { ($_->flags & 0x0101) == 0x0101 } @$dnskey_rrs;
+    # Chaque KSK doit avoir un DS parent correspondant
+    # Calcul mutualisé avec check_rrsig_on_rrset : stocké dans $data pour réutilisation
+    my %dnskey_by_tag = map { $_->keytag => $_ } @$dnskey_rrs;
+    my %ksks_in_ds;
+    for my $ksk (@ksks) {
+        for my $ds (@$ds_rrs) {
+            my $calc = eval { Net::DNS::RR::DS->create($ksk, digtype => $ds->digtype) };
+            next unless $calc;
+            next if $calc->keytag    != $ds->keytag;
+            next if $calc->algorithm != $ds->algorithm;
+            next if uc($calc->digest) ne uc($ds->digest);
+            $ksks_in_ds{$ksk->keytag} = 1;
+            last;
+        }
+
+        my $algo_num = $ksk->algorithm;
+        my $algo_str = $ksk->algorithm('MNEMONIC');
+        if (exists $ksks_in_ds{$ksk->keytag}) {
+            color_line($ctx, 'green', "KSK keytag=%d algo=%d(%s): DS published", $ksk->keytag, $algo_num, $algo_str);
+        } else {
+            color_line($ctx, 'yellow', "KSK keytag=%d algo=%d(%s): no matching DS published", $ksk->keytag, $algo_num, $algo_str);
+            $ok = 0;
+        }
+        if (!$allowed_alg->{$algo_num}) {
+            color_line($ctx, 'yellow', "KSK keytag=%d uses disallowed algorithm %d(%s)", $ksk->keytag, $algo_num, $algo_str);
+        }
+    }
+    $data->{_dnskey_by_tag} = \%dnskey_by_tag;
+    $data->{_ksks_in_ds}    = \%ksks_in_ds;
+
+    # Chaque DS parent doit avoir une DNSKEY correspondante
+    for my $ds (@$ds_rrs) {
+        my $algo_num = $ds->algorithm;
+        my $algo_str = $ds->algorithm('MNEMONIC');
+        if (exists $ksks_in_ds{$ds->keytag}) {
+            debug($ctx, "DS keytag=%d algo=%d(%s): matching DNSKEY found", $ds->keytag, $algo_num, $algo_str);
+        } else {
+            color_line($ctx, 'yellow', "DS keytag=%d algo=%d(%s): no matching DNSKEY in zone", $ds->keytag, $algo_num, $algo_str);
+            $ok = 0;
+        }
+    }
+
+    # On fait le test a la fin car on a besoin de peupler data
+    $ok = 0 unless check_rrsig_on_rrset($ctx, 'DNSKEY', $data->{dnskey_packet}, $data->{dnskey_rrs}, $data, 1);
+
+    return $ok;
+}
+
+sub check_cds_cdnskey {
+    my ($ctx, $data) = @_;
+    my $ok = 1;
+
+    my $cds_rrs  = $data->{cds_rrs}  || [];
+    my $cdns_rrs = $data->{cdns_rrs} || [];
+    my $ds_rrs   = $ctx->{parent_delegation}->{ds_rrs} || [];
+    my $allowed  = $ctx->{cfg}->{allowed_algorithms_map} || {};
+
+    my $has_cds     = @$cds_rrs  > 0;
+    my $has_cdnskey = @$cdns_rrs > 0;
+
+    # 1. Absence de CDS/CDNSKEY
+    if (!$has_cds && !$has_cdnskey) {
+        if ($ctx->{cfg}->{zone_require_permanent_cds_cdnskey}) {
+            color_line($ctx, 'yellow', "No CDS or CDNSKEY published (required by policy)");
+            return 0;
+        }
+        debug($ctx, "No CDS/CDNSKEY (not required by policy)");
+        return 1;
+    }
+
+    # 2. Vérification RRSIG sur CDS et CDNSKEY
+    if ($has_cds)     { $ok = 0 unless check_rrsig_on_rrset($ctx, 'CDS',     $data->{cds_packet},  $cds_rrs,  $data, 1) }
+    if ($has_cdnskey) { $ok = 0 unless check_rrsig_on_rrset($ctx, 'CDNSKEY', $data->{cdns_packet}, $cdns_rrs, $data, 1) }
+
+    # Clé canonique pour comparer des enregistrements DS-like (keytag|algo|digtype|digest)
+    my $ds_key = sub { join('|', $_[0]->keytag, $_[0]->algorithm, $_[0]->digtype, uc($_[0]->digest)) };
+    my %ds_set  = map { $ds_key->($_) => $_ } @$ds_rrs;
+
+    # 3. Construire l'ensemble fusionné zone_ds : CDS directs + CDNSKEY convertis en DS
+    my %zone_ds;  # clé => rr représentatif
+    my %source;   # clé => label pour les messages d'erreur
+
+    for my $cds (@$cds_rrs) {
+        if (%$allowed && !$allowed->{$cds->algorithm}) {
+            my $s = $cds->algorithm('MNEMONIC');
+            $ctx->{bb}->add_color('yellow');
+            bbprint($ctx, "&red CDS keytag=%d: algorithm %d(%s) not in allowed_algorithms",
+                $cds->keytag, $cds->algorithm, $s);
+            $ok = 0;
+        }
+        my $k = $ds_key->($cds);
+        $zone_ds{$k} = $cds;
+        $source{$k}  = 'CDS';
+    }
+
+    for my $cdnskey (@$cdns_rrs) {
+        if (%$allowed && !$allowed->{$cdnskey->algorithm}) {
+            my $s = $cdnskey->algorithm('MNEMONIC');
+            $ctx->{bb}->add_color('yellow');
+            bbprint($ctx, "&red CDNSKEY keytag=%d: algorithm %d(%s) not in allowed_algorithms",
+                $cdnskey->keytag, $cdnskey->algorithm, $s);
+            $ok = 0;
+        }
+        # Convertir en DS pour chaque digtype présent chez le parent
+        my %seen_dig;
+        for my $ds (@$ds_rrs) {
+            next if $seen_dig{$ds->digtype}++;
+            my $calc = eval { Net::DNS::RR::DS->create($cdnskey, digtype => $ds->digtype) };
+            next unless $calc;
+            my $k = $ds_key->($calc);
+            $zone_ds{$k} //= $calc;
+            $source{$k}  //= 'CDNSKEY';
+        }
+    }
+
+    # 4. Comparaison fusionnée zone_ds vs DS parent
+    my @extra   = sort grep { !exists $ds_set{$_}  } keys %zone_ds;
+    my @missing = sort grep { !exists $zone_ds{$_} } keys %ds_set;
+
+    if (!@extra && !@missing) {
+        color_line($ctx, 'green', "CDS/CDNSKEY set matches parent DS (%d record(s))", scalar keys %zone_ds);
+    } else {
+        for my $k (@extra) {
+            my $r = $zone_ds{$k};
+            color_line($ctx, 'yellow', "%s keytag=%d algo=%d digtype=%d: not in parent DS",
+                $source{$k}, $r->keytag, $r->algorithm, $r->digtype);
+            $ok = 0;
+        }
+        for my $k (@missing) {
+            my $r = $ds_set{$k};
+            color_line($ctx, 'yellow', "parent DS keytag=%d algo=%d digtype=%d: not covered by CDS/CDNSKEY",
+                $r->keytag, $r->algorithm, $r->digtype);
+            $ok = 0;
+        }
+    }
+
+    return $ok;
+}
+
+sub check_nsec3param {
+    my ($ctx, $data) = @_;
+    my $ok     = 1;
+    my $warn   = $ctx->{cfg}->{zone_warn_if_no_nsec3} // 1;
+    my $n3_rrs = $data->{n3_rrs} || [];
+
+    if (!@$n3_rrs) {
+        if ($warn) {
+            color_line($ctx, 'yellow', "No NSEC3PARAM found");
+            return 0;
+        }
+        color_line($ctx, 'clear', "No NSEC3PARAM found");
+        return 1;
+    }
+
+    $ok = 0 unless check_rrsig_on_rrset($ctx, 'NSEC3PARAM', $data->{n3_packet}, $data->{n3_rrs}, $data);
+
+    for my $n3 (@$n3_rrs) {
+        my $iter = $n3->iterations;
+        my $salt = $n3->salt // '';
+
+        if ($iter > 100) {
+            color_line($ctx, 'red', "NSEC3PARAM iterations=%d > 100: violates RFC 9276", $iter);
+            $ok = 0;
+        } elsif ($iter > 0) {
+            color_line($ctx, 'yellow', "NSEC3PARAM iterations=%d > 0: not RFC 9276 compliant (should be 0)", $iter);
+            $ok = 0;
+        } else {
+            debug($ctx, "NSEC3PARAM iterations=0: RFC 9276 compliant");
+        }
+        # Salt vide = '-' ou chaîne vide dans Net::DNS
+        if (defined $salt && $salt ne '' && $salt ne '-') {
+            color_line($ctx, 'yellow', "NSEC3PARAM salt is not empty: not RFC 9276 compliant");
+            $ok = 0;
+        } else {
+            debug($ctx, "NSEC3PARAM salt empty: RFC 9276 compliant");
+        }
+    }
+
+    color_line($ctx, 'green', "NSEC3PARAM is RFC 9276 compliant") if $ok;
+    return $ok;
+}
+
+sub check_ns_set_vs_parent {
+    my ($ctx, $data) = @_;
+    my $ok = 1;
+
+    my $parent_ns_rrs = $ctx->{parent_delegation}->{ns_rrs} || [];
+    my $server_ns_rrs = $data->{ns_rrs} || [];
+
+    my %parent_set = map { lc($_->nsdname) =~ s/\.+$//r => 1 } @$parent_ns_rrs;
+    my %server_set = map { lc($_->nsdname) =~ s/\.+$//r => 1 } @$server_ns_rrs;
+
+    my @only_parent = sort grep { !$server_set{$_} } keys %parent_set;
+    my @only_server = sort grep { !$parent_set{$_} } keys %server_set;
+
+    $ok = 0 unless check_rrsig_on_rrset($ctx, 'NS', $data->{ns_packet}, $data->{ns_rrs}, $data);
+
+    if (!@only_parent && !@only_server) {
+        color_line($ctx, 'green', "NS set matches parent delegation");
+        return $ok;
+    }
+
+    color_line($ctx, 'yellow', "NS in parent but not in zone: %s", join(', ', @only_parent)) if (@only_parent);
+    color_line($ctx, 'yellow', "NS in zone but not in parent: %s", join(', ', @only_server)) if (@only_server);
+
+    return 0;
+}
+
+sub check_glue_coherence {
+    my ($ctx, $ns, $data) = @_;
+
+    my $glue_map = $ctx->{parent_delegation}->{glue_map} || {};
+
+    if (!%$glue_map) {
+        color_line($ctx, 'green', "No glue entries in parent delegation");
+        return 1;
+    }
+
+    my $resolver = build_authoritative_resolver($ctx, $ns->{ips}, $ns->{hostname});
+    my $ok = 1;
+
+    for my $host (sort keys %$glue_map) {
+        my $glue_ips   = $glue_map->{$host} || [];
+        my $actual_ips = resolve_host_ips($ctx, $resolver, $host . '.');
+
+        my %glue_set   = map { $_ => 1 } @$glue_ips;
+        my %actual_set = map { $_ => 1 } @$actual_ips;
+
+        if (join(',', sort keys %glue_set) ne join(',', sort keys %actual_set)) {
+            color_line($ctx, 'yellow',
+                "Glue mismatch for %s: parent says [%s], zone says [%s]",
+                $host,
+                join(',', sort @$glue_ips),
+                join(',', sort @$actual_ips));
+            $ok = 0;
+        } else {
+            debug($ctx, "Glue for %s consistent with parent delegation", $host);
+        }
+    }
+
+    color_line($ctx, 'green', "All glue entries consistent with parent delegation") if $ok;
+    return $ok;
+}
+
+# ---------------------------------------------------------------------------
+# NS checks: Phase 4 — Orchestrateur
+# ---------------------------------------------------------------------------
+
+sub run_ns_checks {
+    my ($ctx, $ns, $data) = @_;
+    my $ok  = 1;
+
+    bbprint($ctx, "SOA serial=%d mname=%s", $data->{soa_serial}, $data->{soa_mname});
+    $ok = 0 unless check_ds_dnskey_bidirectional($ctx, $data); # modification de data
+
+    $ok = 0 unless check_rrsig_on_rrset($ctx, 'SOA', $data->{soa_packet}, $data->{soa_rrs}, $data);
+    $ok = 0 unless check_cds_cdnskey($ctx, $data);
+    $ok = 0 unless check_nsec3param($ctx, $data);
+    $ok = 0 unless check_ns_set_vs_parent($ctx, $data);
+    $ok = 0 unless check_glue_coherence($ctx, $ns, $data);
+
+    return $ok;
+}
+
+exit main();
+

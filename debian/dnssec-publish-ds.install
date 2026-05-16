@@ -1,0 +1,5 @@
+_build/bin/dnssec-publish-ds usr/sbin/
+completions/dnssec-publish-ds.bash usr/share/bash-completion/completions/
+completions/_dnssec-publish-ds usr/share/zsh/vendor-completions/
+completions/dnssec-publish-ds.fish usr/share/fish/vendor_completions.d/
+config/dnssec-publish-ds.toml etc/dnssec-publish-ds/config.toml

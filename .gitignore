@@ -12,6 +12,8 @@
 # Debian helper/generated files
 debian/debhelper-build-stamp
 debian/dnssec-publish-ds/
+debian/xymon-ext-dnssec/
+debian/tmp/
 debian/*.debhelper
 debian/*.debhelper.log
 debian/*.substvars

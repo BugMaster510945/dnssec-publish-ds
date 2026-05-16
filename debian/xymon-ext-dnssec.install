@@ -1,0 +1,3 @@
+xymon/server/ext/xymon-ext-dnssec usr/lib/xymon/server/ext/
+xymon/server/etc/xymon-ext-dnssec.cfg etc/xymon/xymonlaunch.d/
+config/xymon-ext-dnssec.yaml usr/share/doc/xymon-ext-dnssec/examples/

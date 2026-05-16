@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+purge)
+	# Remove state and configuration
+	rm -rf /var/lib/dnssec-publish-ds
+	rm -rf /etc/dnssec-publish-ds
+
+	# Remove system user
+	if getent passwd dnssec-publish-ds >/dev/null 2>&1; then
+		deluser --system dnssec-publish-ds || true
+	fi
+	if getent group dnssec-publish-ds >/dev/null 2>&1; then
+		delgroup --system dnssec-publish-ds || true
+	fi
+	;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+configure)
+	# Create system user if it doesn't exist
+	if ! getent passwd dnssec-publish-ds >/dev/null 2>&1; then
+		adduser --system --group --no-create-home \
+			--home /var/lib/dnssec-publish-ds \
+			--gecos "DNSSEC DS publisher daemon" \
+			dnssec-publish-ds
+	fi
+
+	# Create state directory with proper ownership
+	install -d -o dnssec-publish-ds -g dnssec-publish-ds -m 0750 /var/lib/dnssec-publish-ds
+	;;
+esac
+
+#DEBHELPER#
+
+exit 0
