@@ -1,0 +1,32 @@
+# dnssec-publish-ds configuration
+#
+# Global settings
+
+# Path to the status file (persists operation state across restarts)
+# status_file = "/var/lib/dnssec-publish-ds/status.json"
+
+# DNS query timeout
+# dns_timeout = "5s"
+
+# Log level: debug, info, warn, error
+# log_level = "info"
+
+# Groups define sets of zones managed by a specific plugin.
+# Each group is defined under [group.NAME] where NAME is the group identifier.
+# Multiple groups can be defined in the main file or in separate files under conf.d/.
+
+# Example group using OVH API v1:
+#
+# [group.ovh-main]
+# plugin = "ovh-v1"
+# check_interval = "12h"
+# zones = [
+#     "example.com",
+#     "example.org",
+# ]
+#
+# [group.ovh-main.plugin_config]
+# endpoint = "ovh-eu"
+# application_key = "your_app_key"
+# application_secret = "your_app_secret"
+# consumer_key = "your_consumer_key"
