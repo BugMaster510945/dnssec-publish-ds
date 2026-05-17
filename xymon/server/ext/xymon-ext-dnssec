@@ -9,7 +9,9 @@ use Net::DNS;
 use Net::DNS::RR::DNSKEY;
 use Net::DNS::SEC;
 use YAML::Tiny;
-use Storable qw(dclone);
+use Storable qw(dclone nstore retrieve);
+use Data::Dumper;
+use Time::HiRes qw(time);
 
 # Package Guard permet d'emuler le defer en go
 { package Guard; sub new { bless \$_[1], $_[0] } sub DESTROY { ${$_[0]}->() } }
@@ -25,7 +27,45 @@ my %DEFAULTS = (
     nameservers         => [],
     hosts_cfg           => '',
     server_options      => {},
+    cache_file          => 'xymon-ext-dnssec.cache',
+    cache_default_ttl   => 3600,
 );
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+sub _resolve_cache_path {
+    my ($cfg) = @_;
+    return undef if !defined $cfg || !defined $cfg->{cache_file};
+    return undef if $cfg->{cache_file} eq '-';
+    my $file = $cfg->{cache_file} || 'xymon-ext-dnssec.cache';
+    if ($file =~ m{^/}) {
+        return $file;
+    }
+    my $dir = $ENV{XYMONTMP} || $ENV{TMP} || '/tmp';
+    return "$dir/$file";
+}
+
+sub load_cache {
+    my ($path) = @_;
+    return {} unless defined $path && $path ne q{} && -f $path;
+    my $cache = {};
+    eval { $cache = retrieve($path) || {}; };
+    if ($@) {
+        warn sprintf("xymon-ext-dnssec: failed to read cache %s: %s\n", $path, $@);
+        $cache = {};
+    }
+    return $cache;
+}
+
+sub save_cache {
+    my ($path, $cache) = @_;
+    return unless defined $path && defined $cache;
+    eval { nstore($cache, $path); };
+    if ($@) {
+        warn sprintf("xymon-ext-dnssec: failed to nstore cache to %s: %s\n", $path, $@);
+    }
+}
 
 sub main {
     my @cli_zones;
@@ -45,6 +85,14 @@ sub main {
     push @cli_zones, @ARGV;
 
     my $cfg = load_probe_config($config_path);
+    # Cache handling: resolve path and load cache (unless disabled with "-")
+    my $cache_path = _resolve_cache_path($cfg);
+    my $cache = load_cache($cache_path);
+    if ($debug) {
+        print "[xymon-ext-dnssec] cache_path=" . (defined $cache_path ? $cache_path : "(undef)") . "\n";
+        print Dumper($cache);
+    }
+
     if (defined $hosts_cfg_override && $hosts_cfg_override ne q{}) {
         $cfg->{hosts_cfg} = $hosts_cfg_override;
         $ENV{HOSTSCFG} = $hosts_cfg_override;
@@ -73,7 +121,14 @@ sub main {
         $ctx{cfg} = merge_zone_options($cfg, $entry->{options});
         $ctx{debug} = $debug;
         $ctx{debug_dns} = $debug_dns;
-
+        $ctx{zone_cache} = {};
+        # Attach zone-local cache to context. If entry exists and not expired, clone it; else attach empty.
+        my $zone_started_with_cache = 0;
+        if (exists $cache->{ $entry->{zone} } && ref $cache->{ $entry->{zone} } eq 'HASH' && ($cache->{ $entry->{zone} }->{expiry} || 0) > time()) {
+            $ctx{zone_cache} = dclone( $cache->{ $entry->{zone} } );
+            $zone_started_with_cache = 1;
+        }
+        my $zone_start_time = time();
         $bb->print("Zone: $ctx{zone}\n");
         {
             my $zone_options = $entry->{options};
@@ -82,8 +137,20 @@ sub main {
         $bb->print("\n");
 
         run_zone_checks(\%ctx);
+        # Print elapsed time for this zone
+        my $zone_elapsed = time() - $zone_start_time;
+        my $secs = sprintf("%.9f", $zone_elapsed);
+        $bb->print("Seconds: $secs" . ($zone_started_with_cache ? ' (cache)' : '') . "\n");
+        # Rebuild in-memory cache entry for this zone according to final color
+        delete $cache->{ $ctx{zone} };
+        if ($bb->{color} eq 'green') {
+            $cache->{ $ctx{zone} } = $ctx{zone_cache};
+        }
         $bb->send();
     }
+
+    # Save cache once at end of probe execution
+    save_cache($cache_path, $cache);
 
     return 0;
 }
@@ -232,18 +299,32 @@ sub run_zone_checks {
     $ctx->{parent_zone} = $parent_zone;
 
     # --- Phase 2: Discover parent NS ---
-    my ($parent_ips, $parent_ips_err) = discover_parent_ns($ctx, $parent_zone);
-    return if( check_error($ctx, $parent_ips_err, "Parent NS discovery failed: %s", $parent_ips_err) );
-    debug($ctx, "Parent NS: %d IP(s)", scalar @$parent_ips);
+    # --- Phase 2/3: Use cached parent delegation if available, else discover & fetch ---
+    if ($ctx->{zone_cache} && ref $ctx->{zone_cache} eq 'HASH' && keys %{$ctx->{zone_cache}}) {
+        debug($ctx, "Using cached parent delegation for %s", $ctx->{zone});
+        # Reconstruct RR objects from strings
+        my @ns_rrs = map { Net::DNS::RR->new($_) } @{ $ctx->{zone_cache}->{ns_rrs} || [] };
+        my @ds_rrs = map { Net::DNS::RR->new($_) } @{ $ctx->{zone_cache}->{ds_rrs} || [] };
+        $ctx->{parent_delegation} = {
+            ns_rrs    => \@ns_rrs,
+            ds_rrs    => \@ds_rrs,
+            glue_map  => $ctx->{zone_cache}->{glue_map},
+            hints_map => $ctx->{zone_cache}->{hints_map},
+        };
+    } else {
+        my ($parent_ips, $parent_ips_err) = discover_parent_ns($ctx, $parent_zone);
+        return if( check_error($ctx, $parent_ips_err, "Parent NS discovery failed: %s", $parent_ips_err) );
+        debug($ctx, "Parent NS: %d IP(s)", scalar @$parent_ips);
 
-    # --- Phase 3: Fetch delegation from parent ---
-    my ($delegation, $delegation_err) = fetch_delegation_from_parent($ctx, $parent_ips);
-    return if( check_error($ctx, $delegation_err, "Delegation query failed: %s", $delegation_err) );
-    return if( check_error($ctx, !@{$delegation->{ds_rrs}}, "No DS at parent zone (%s): zone not in DNSSEC chain", $parent_zone) );
-    $ctx->{parent_delegation} = $delegation;
+        # Fetch delegation from parent and allow it to populate $ctx->{zone_cache}
+        my ($delegation, $delegation_err) = fetch_delegation_from_parent($ctx, $parent_ips);
+        return if( check_error($ctx, $delegation_err, "Delegation query failed: %s", $delegation_err) );
+        return if( check_error($ctx, !@{$delegation->{ds_rrs}}, "No DS at parent zone (%s): zone not in DNSSEC chain", $parent_zone) );
+        $ctx->{parent_delegation} = $delegation;
+    }
 
     # --- Phase 4: Check DS from parent for unsupported algorithms ---
-    check_parent_ds_algorithms($ctx, $delegation->{ds_rrs});
+    check_parent_ds_algorithms($ctx, $ctx->{parent_delegation}->{ds_rrs});
 
     # --- Phase 5: Build zone NS list ---
     my $ns_list = build_zone_ns_list($ctx);
@@ -511,9 +592,32 @@ sub fetch_delegation_from_parent {
         return (undef, $ds_err) if $ds_err;
     }
 
+    # Prepare return structure
+    my $ds_list_ref = $ds_rrs // \@ds_rrs;
+
+    # Compute a conservative min TTL from delegation NS and additional records
+    my $min_ttl;
+    for my $rr (@ns_rrs) {
+        $min_ttl = $rr->ttl if !defined $min_ttl || $rr->ttl < $min_ttl;
+    }
+    for my $rr ($ns_packet->additional) {
+        next unless $rr->type eq 'A' || $rr->type eq 'AAAA';
+        $min_ttl = $rr->ttl if !defined $min_ttl || $rr->ttl < $min_ttl;
+    }
+    my $expiry = time() + ($min_ttl || $ctx->{cfg}->{cache_default_ttl} || 3600);
+
+    # Populate zone-local cache in context (serialized as strings)
+    $ctx->{zone_cache} = {
+        ns_rrs  => [ map { $_->string } @ns_rrs ],
+        ds_rrs  => [ map { $_->string } @{ $ds_list_ref || [] } ],
+        glue_map  => \%glue_map,
+        hints_map => \%hints_map,
+        expiry => $expiry,
+    };
+
     return ({
         ns_rrs    => \@ns_rrs,
-        ds_rrs    => $ds_rrs // \@ds_rrs,
+        ds_rrs    => $ds_list_ref,
         glue_map  => \%glue_map,
         hints_map => \%hints_map,
     }, undef);

@@ -68,6 +68,12 @@ wire-level debug output.
 Use
 .B \-\-no\-debug\-dns
 to explicitly disable (default).
+.TP
+\fB\-\-cache\-file\fR \fIFILE\fR
+Path to the on-disk cache file for parent delegation data. Value "-" disables the cache. If a relative path is provided it is resolved under the directory given by the environment variable \fBXYMONTMP\fR or, if absent, \fBTMP\fR. The probe does not create missing directories for relative paths.
+.TP
+\fB\-\-cache\-default\-ttl\fR \fISECONDS\fR
+Default TTL (in seconds) to use when the computed delegation min-TTL cannot be determined. Default: \fB3600\fR.
 .SH CONFIGURATION FILE
 The probe reads a YAML configuration file (default:
 .IR /etc/xymon/xymon-ext-dnssec.yaml ).
@@ -88,6 +94,12 @@ environment variable or the
 .B \-\-hosts\-cfg
 CLI option.
 Default: (empty \(em relies on the environment variable set by Xymon)
+.TP
+\fBcache_file\fR \fIPATH\fR
+Path to the on-disk cache file used to store parent delegation data. Use "-" to disable the cache. Relative paths are resolved under \fBXYMONTMP\fR or \fBTMP\fR; the probe does not create directories for relative paths. Default: \fBxymon-ext-dnssec.cache\fR
+.TP
+\fBcache_default_ttl\fR \fISECONDS\fR
+Fallback TTL (seconds) used when the probe cannot compute a min-TTL from parent delegation records. Default: \fB3600\fR
 .TP
 \fBresolver_timeout\fR \fISECONDS\fR
 UDP/TCP timeout for DNS queries (integer).
