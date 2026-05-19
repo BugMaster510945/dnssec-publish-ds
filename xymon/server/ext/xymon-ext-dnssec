@@ -341,18 +341,19 @@ sub run_zone_checks {
 
         bbprint($ctx, "%s (%s)", $name, join(', ', @$ips));
         push @defer, Guard->new(sub { bbprint($ctx, ""); }); # Saute une ligne
-        next if( check_error($ctx, !@$ips, "No resolved IPs for NS %s", $name) );
+        next if( redwarn_error($ctx, !@$ips, "No resolved IPs for NS %s", $name) );
 
         my ($data, $data_err) = fetch_zone_state_from_server($ctx, $name, $ips);
-        next if check_error($ctx, $data_err, "Failed to fetch zone state from %s: %s", $name, $data_err);
+        next if redwarn_error($ctx, $data_err, "Failed to fetch zone state from %s: %s", $name, $data_err);
 
         $ns_total++;
         $ns_passed++ if run_ns_checks($ctx, $ns, $data);
     }
 
-    if ($ns_total > 0 && $ns_passed == 0) {
-        color_line($ctx, 'red', "No DNS server is fully compliant");
-    }
+    # Summary: x/y DNS servers fully compliant (color decided in one expression)
+    color_line($ctx, $ns_passed == 0 ? 'red' : ($ns_passed == $ns_total ? 'green' : 'yellow'),
+        "%d/%d DNS servers fully compliant", $ns_passed, $ns_total);
+    bbprint($ctx, ""); # Saute une ligne
 }
 
 # ---------------------------------------------------------------------------
@@ -752,6 +753,18 @@ sub warn_error {
     return $err;
 }
 
+sub redwarn_error {
+    my ($ctx, $err, $fmt, @args) = @_;
+    return $err unless $ctx && ref $ctx eq 'HASH';
+    return $err unless $err;
+    my $bb = $ctx->{bb};
+    return unless $bb;
+    # on Fait un bbprint au lieu d'un color_line car un fail sur 1 serveur c'est pas dramatique
+    $bb->add_color('yellow');
+    bbprint($ctx, "&red ".$fmt, @args);
+    return $err;
+}
+
 sub color_line {
     my ($ctx, $color, $fmt, @args) = @_;
     return unless $ctx && ref $ctx eq 'HASH';
@@ -804,12 +817,7 @@ sub check_rrsig_on_rrset {
     my $ok = 1;
     my @rrsigs = grep { $_->type eq 'RRSIG' && uc($_->typecovered) eq uc($rrtype) } $packet->answer;
 
-    if (!@rrsigs) {
-        # on Fait un bbprint au lieu d'un color_line car un fail su 1 serveur c'est pas dramatique
-        $ctx->{bb}->add_color('yellow');
-        bbprint($ctx, "&red No RRSIG found for %s", $rrtype);
-        return 0;
-    }
+    return 0 if (redwarn_error($ctx, !@rrsigs, "No RRSIG found for %s", $rrtype));
 
     my $dnskey_by_tag = $data->{_dnskey_by_tag} || {};
     my $ksks_in_ds    = $data->{_ksks_in_ds}    || {};
@@ -820,27 +828,16 @@ sub check_rrsig_on_rrset {
         my $signer = $dnskey_by_tag->{$keytag};
 
         # 1. Le signataire doit exister dans le DNSKEY set
-        if (!$signer) {
-            $ctx->{bb}->add_color('yellow');
-            bbprint($ctx, "&red RRSIG(%s) keytag=%d references unknown DNSKEY", $rrtype, $keytag);
-            $ok = 0;
-            next;
-        }
+        $ok = 0 if !$signer;
+        next if redwarn_error($ctx, !$signer, "RRSIG(%s) keytag=%d references unknown DNSKEY", $rrtype, $keytag);
 
         # 2. Validation cryptographique
         my $valid = eval { $rrsig->verify($rrset_rrs, $signer) };
-        if ($@) {
-            $ctx->{bb}->add_color('yellow');
-            bbprint($ctx, "&red RRSIG(%s) keytag=%d crypto error: %s", $rrtype, $keytag, $@);
-            $ok = 0;
-            next;
-        }
-        if (!$valid) {
-            $ctx->{bb}->add_color('yellow');
-            bbprint($ctx, "&red RRSIG(%s) keytag=%d signature invalid", $rrtype, $keytag);
-            $ok = 0;
-            next;
-        }
+        $ok = 0 if $@;
+        next if redwarn_error($ctx, $@, "RRSIG(%s) keytag=%d crypto error: %s", $rrtype, $keytag, $@);
+
+        $ok = 0 if !$valid;
+        next if redwarn_error($ctx, !$valid, "RRSIG(%s) keytag=%d signature invalid", $rrtype, $keytag);
 
         # 3. Expiration imminente : now + TTL > sigexpiration → le cache peut distribuer une sig expirée
         my $ttl        = ($rrset_rrs && @$rrset_rrs) ? $rrset_rrs->[0]->ttl : 0;
@@ -989,26 +986,14 @@ sub check_cds_cdnskey {
     my %source;   # clé => label pour les messages d'erreur
 
     for my $cds (@$cds_rrs) {
-        if (%$allowed && !$allowed->{$cds->algorithm}) {
-            my $s = $cds->algorithm('MNEMONIC');
-            $ctx->{bb}->add_color('yellow');
-            bbprint($ctx, "&red CDS keytag=%d: algorithm %d(%s) not in allowed_algorithms",
-                $cds->keytag, $cds->algorithm, $s);
-            $ok = 0;
-        }
+        $ok = 0 if redwarn_error($ctx, %$allowed && !$allowed->{$cds->algorithm}, "CDS keytag=%d: algorithm %d(%s) not in allowed_algorithms", $cds->keytag, $cds->algorithm, $cds->algorithm('MNEMONIC'));
         my $k = $ds_key->($cds);
         $zone_ds{$k} = $cds;
         $source{$k}  = 'CDS';
     }
 
     for my $cdnskey (@$cdns_rrs) {
-        if (%$allowed && !$allowed->{$cdnskey->algorithm}) {
-            my $s = $cdnskey->algorithm('MNEMONIC');
-            $ctx->{bb}->add_color('yellow');
-            bbprint($ctx, "&red CDNSKEY keytag=%d: algorithm %d(%s) not in allowed_algorithms",
-                $cdnskey->keytag, $cdnskey->algorithm, $s);
-            $ok = 0;
-        }
+        $ok = 0 if redwarn_error($ctx, %$allowed && !$allowed->{$cdnskey->algorithm}, "CDNSKEY keytag=%d: algorithm %d(%s) not in allowed_algorithms", $cdnskey->keytag, $cdnskey->algorithm, $cdnskey->algorithm('MNEMONIC'));
         # Convertir en DS pour chaque digtype présent chez le parent
         my %seen_dig;
         for my $ds (@$ds_rrs) {
