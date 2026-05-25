@@ -126,7 +126,6 @@ sub main {
         my $zone_started_with_cache = 0;
         if (exists $cache->{ $entry->{zone} } && ref $cache->{ $entry->{zone} } eq 'HASH' && ($cache->{ $entry->{zone} }->{expiry} || 0) > time()) {
             $ctx{zone_cache} = dclone( $cache->{ $entry->{zone} } );
-            $zone_started_with_cache = 1;
         }
         my $zone_start_time = time();
         $bb->print("Zone: $ctx{zone}\n");
@@ -139,8 +138,7 @@ sub main {
         run_zone_checks(\%ctx);
         # Print elapsed time for this zone
         my $zone_elapsed = time() - $zone_start_time;
-        my $secs = sprintf("%.9f", $zone_elapsed);
-        $bb->print("Seconds: $secs" . ($zone_started_with_cache ? ' (cache)' : '') . "\n");
+        $bb->print(sprintf("Seconds: %.9f\n", $zone_elapsed));
         # Rebuild in-memory cache entry for this zone according to final color
         delete $cache->{ $ctx{zone} };
         if ($bb->{color} eq 'green') {
@@ -310,6 +308,7 @@ sub run_zone_checks {
             ds_rrs    => \@ds_rrs,
             glue_map  => $ctx->{zone_cache}->{glue_map},
             hints_map => $ctx->{zone_cache}->{hints_map},
+            cache     => 1,
         };
     } else {
         my ($parent_ips, $parent_ips_err) = discover_parent_ns($ctx, $parent_zone);
@@ -332,7 +331,7 @@ sub run_zone_checks {
     bbprint($ctx, ""); # Saute une ligne
 
     my $ns_passed = 0;
-    my $ns_total  = 0;
+    my $ns_total  = scalar @{$ns_list};
     # --- Phase 6: Advanced tests on each NS ---
     for my $ns (sort { lc($a->{hostname}) cmp lc($b->{hostname}) } @$ns_list) {
         my $name = $ns->{hostname};
@@ -343,10 +342,11 @@ sub run_zone_checks {
         push @defer, Guard->new(sub { bbprint($ctx, ""); }); # Saute une ligne
         next if( redwarn_error($ctx, !@$ips, "No resolved IPs for NS %s", $name) );
 
+        my $t0 = time();
         my ($data, $data_err) = fetch_zone_state_from_server($ctx, $name, $ips);
         next if redwarn_error($ctx, $data_err, "Failed to fetch zone state from %s: %s", $name, $data_err);
+        $data->{time} = time() - $t0;
 
-        $ns_total++;
         $ns_passed++ if run_ns_checks($ctx, $ns, $data);
     }
 
@@ -456,7 +456,7 @@ sub resolve_host_ips {
 
 sub fetch_zone_state_from_server {
     my ($ctx, $server_name, $server_ips) = @_;
-    my $server_ip_label = join(',', @$server_ips);
+    my $server_ip_label = join(', ', @$server_ips);
 
     my $resolver = build_authoritative_resolver($ctx, $server_ips, $server_name);
 
@@ -629,6 +629,9 @@ sub build_zone_ns_list {
 
     my @ns_list;
     my %seen;
+    my $parent_ns_count = scalar @{ $ctx->{parent_delegation}->{ns_rrs}};
+    my $cache_suffix = $ctx->{parent_delegation}->{cache} ? ' (cache)' : '';
+    bbprint($ctx, "Parent delegation: %d NS%s", $parent_ns_count, $cache_suffix);
     for my $ns (sort { lc($a->nsdname) cmp lc($b->nsdname) } @{$ctx->{parent_delegation}->{ns_rrs}}) {
         my @ips;
         my $host = lc($ns->nsdname);
@@ -640,7 +643,7 @@ sub build_zone_ns_list {
             my $resolved = resolve_host_ips($ctx, $ctx->{recursive}, $host);
             @ips = @$resolved;
         }
-        debug($ctx, "Parent delegation NS %s has IPs: %s (glue=%s)", $host, join(',', @ips), exists $ctx->{parent_delegation}->{glue_map}->{$host} ? 'yes' : 'no');
+        debug($ctx, "Parent delegation NS %s has IPs: %s (glue=%s)", $host, join(', ', @ips), exists $ctx->{parent_delegation}->{glue_map}->{$host} ? 'yes' : 'no');
 
         push @ns_list, { hostname => $host, ips => \@ips, is_glue => (exists $ctx->{parent_delegation}->{glue_map}->{$host} ? 1 : 0) };
     }
@@ -779,15 +782,16 @@ sub color_line {
 # ---------------------------------------------------------------------------
 sub check_parent_ds_algorithms {
     my ($ctx, $ds_rrs) = @_;
+    my $cache_suffix = $ctx->{parent_delegation}->{cache} ? ' (cache)' : '';
     my $allowed = $ctx->{cfg}->{allowed_algorithms_map};
     for my $ds (@$ds_rrs) {
         my $algo = $ds->algorithm;
         my $algo_str = Net::DNS::RR::DNSKEY->algorithm($algo) || $algo;
         my $keytag = $ds->keytag;
         if ($allowed->{$algo}) {
-            color_line($ctx, 'green', "Parent DS keytag=%d algo=%d(%s)", $keytag, $algo, $algo_str);
+            color_line($ctx, 'green', "Parent DS keytag=%d algo=%d(%s)%s", $keytag, $algo, $algo_str, $cache_suffix);
         } else {
-            color_line($ctx, 'yellow', "Parent DS keytag=%d algo=%d(%s): NOT allowed", $keytag, $algo, $algo_str);
+            color_line($ctx, 'yellow', "Parent DS keytag=%d algo=%d(%s): NOT allowed%s", $keytag, $algo, $algo_str, $cache_suffix);
         }
     }
 }
@@ -1123,8 +1127,8 @@ sub check_glue_coherence {
             color_line($ctx, 'yellow',
                 "Glue mismatch for %s: parent says [%s], zone says [%s]",
                 $host,
-                join(',', sort @$glue_ips),
-                join(',', sort @$actual_ips));
+                join(', ', sort @$glue_ips),
+                join(', ', sort @$actual_ips));
             $ok = 0;
         } else {
             debug($ctx, "Glue for %s consistent with parent delegation", $host);
@@ -1152,6 +1156,7 @@ sub run_ns_checks {
     $ok = 0 unless check_ns_set_vs_parent($ctx, $data);
     $ok = 0 unless check_glue_coherence($ctx, $ns, $data);
 
+    bbprint($ctx, "Seconds: %s", sprintf("%.9f", $data->{time}));
     return $ok;
 }
 
