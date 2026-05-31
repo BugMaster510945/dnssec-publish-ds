@@ -28,14 +28,14 @@ override_dh_auto_build-arch:
 	$(BIN_PATH) completion bash > completions/dnssec-publish-ds.bash
 	$(BIN_PATH) completion zsh > completions/_dnssec-publish-ds
 	$(BIN_PATH) completion fish > completions/dnssec-publish-ds.fish
+	mmark -man man/dnssec-publish-ds.8.md > man/dnssec-publish-ds.8
 
 override_dh_auto_install-indep override_dh_auto_install-arch:
 	# On install sans go qui est buggue
 	:
 
 override_dh_auto_build-indep:
-	# Skip compilation for arch-independent builds (no Go build should run)
-	:
+	mmark -man man/xymon-ext-dnssec.1.md > man/xymon-ext-dnssec.1
 
 override_dh_auto_clean:
 	# Remove built artefacts so next build starts fresh

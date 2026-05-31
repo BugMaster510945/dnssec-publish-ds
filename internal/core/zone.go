@@ -9,6 +9,7 @@ import (
 
 	"github.com/miekg/dns"
 
+	"gitlab.syshawk.com/planchon/dnssec-publish-ds/internal/core/helpers"
 	"gitlab.syshawk.com/planchon/dnssec-publish-ds/internal/logging"
 	"gitlab.syshawk.com/planchon/dnssec-publish-ds/internal/plugin"
 	"gitlab.syshawk.com/planchon/dnssec-publish-ds/internal/status"
@@ -37,8 +38,8 @@ type ZoneRunner struct {
 }
 
 type zoneDNSClient interface {
-	FetchZoneKeys(zone string) ([]plugin.KeyRecord, bool, error)
-	QueryDS(zone string) ([]*dns.DS, error)
+	FetchZoneKeys(ctx context.Context, zone string) ([]plugin.KeyRecord, bool, error)
+	QueryDS(ctx context.Context, zone string) ([]*dns.DS, error)
 }
 
 // NewZoneRunner creates a runner for a zone.
@@ -82,7 +83,7 @@ func (z *ZoneRunner) Run(ctx context.Context) {
 
 func (z *ZoneRunner) runStep(ctx context.Context) (time.Duration, bool) {
 	state := z.loadOwnedState()
-	req, active, err := z.prepareUpdateRequest(state)
+	req, active, err := z.prepareUpdateRequest(ctx, state)
 	if err != nil {
 		return z.errorRetryInterval, ctx.Err() == nil
 	}
@@ -128,7 +129,7 @@ func (z *ZoneRunner) loadOwnedState() *status.ZoneState {
 	return nil
 }
 
-func (z *ZoneRunner) prepareUpdateRequest(state *status.ZoneState) (*plugin.UpdateRequest, bool, error) {
+func (z *ZoneRunner) prepareUpdateRequest(ctx context.Context, state *status.ZoneState) (*plugin.UpdateRequest, bool, error) {
 	if state != nil && state.InProgress {
 		return &plugin.UpdateRequest{
 			Zone: z.zone,
@@ -138,7 +139,7 @@ func (z *ZoneRunner) prepareUpdateRequest(state *status.ZoneState) (*plugin.Upda
 
 	z.log.Info("checking zone alignment")
 
-	desiredKeys, isRemoval, err := z.dns.FetchZoneKeys(z.zone)
+	desiredKeys, isRemoval, err := z.dns.FetchZoneKeys(ctx, z.zone)
 	if err != nil {
 		z.log.Error("failed to fetch zone keys", "error", err)
 		return nil, false, err
@@ -165,7 +166,7 @@ func (z *ZoneRunner) prepareUpdateRequest(state *status.ZoneState) (*plugin.Upda
 		}
 	}
 
-	currentDS, err := z.dns.QueryDS(z.zone)
+	currentDS, err := z.dns.QueryDS(ctx, z.zone)
 	if err != nil {
 		z.log.Error("failed to query DS records", "error", err)
 		return nil, false, err
@@ -173,7 +174,7 @@ func (z *ZoneRunner) prepareUpdateRequest(state *status.ZoneState) (*plugin.Upda
 
 	z.logCurrentDS(currentDS)
 
-	toAdd, toRemove := CompareDS(currentDS, desiredKeys)
+	toAdd, toRemove := helpers.CompareDS(currentDS, desiredKeys)
 	if len(toAdd) == 0 && len(toRemove) == 0 {
 		z.log.Info("zone is aligned, no changes needed")
 		return nil, false, nil
@@ -313,52 +314,18 @@ func (z *ZoneRunner) logModifications(toAdd, toRemove []plugin.KeyRecord) {
 	}
 }
 
-// min returns the minimum of two integers.
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // algoString returns the algorithm name for a DNSSEC algorithm ID.
 func algoString(algo uint8) string {
-	switch algo {
-	case 5:
-		return "RSASHA1"
-	case 7:
-		return "RSASHA256"
-	case 8:
-		return "RSASHA512"
-	case 10:
-		return "RSAMD5"
-	case 12:
-		return "ECCGOST"
-	case 13:
-		return "ECDSAP256SHA256"
-	case 14:
-		return "ECDSAP384SHA384"
-	case 15:
-		return "ED25519"
-	case 16:
-		return "ED448"
-	default:
-		return "UNKNOWN"
+	if name, ok := dns.AlgorithmToString[algo]; ok {
+		return name
 	}
+	return "UNKNOWN"
 }
 
 // digestTypeString returns the digest type name for a DS digest type ID.
 func digestTypeString(dt uint8) string {
-	switch dt {
-	case 1:
-		return "SHA1"
-	case 2:
-		return "SHA256"
-	case 3:
-		return "GOST"
-	case 4:
-		return "SHA384"
-	default:
-		return "UNKNOWN"
+	if name, ok := dns.HashToString[dt]; ok {
+		return name
 	}
+	return "UNKNOWN"
 }

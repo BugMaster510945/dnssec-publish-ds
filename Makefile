@@ -39,6 +39,8 @@ completions: build
 
 man:
 	@mkdir -p man
+	mmark -man man/$(BINARY).8.md > man/$(BINARY).8
+	mmark -man man/$(PROBE).1.md > man/$(PROBE).1
 	gzip -kf man/$(BINARY).8
 	gzip -kf man/$(PROBE).1
 

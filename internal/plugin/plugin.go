@@ -23,6 +23,9 @@ type Plugin interface {
 	// NewGroup creates one group-specific plugin instance from
 	// [group.<name>.plugin_config].
 	NewGroup(groupName string, groupConfig map[string]any) (GroupPlugin, error)
+
+	// Close allows the global plugin to cleanup resources on shutdown.
+	Close() error
 }
 
 // GroupPlugin is a group-specific instance created by a Plugin.
@@ -35,6 +38,9 @@ type GroupPlugin interface {
 	Capabilities() Capabilities
 
 	Update(ctx context.Context, req UpdateRequest) (UpdateResult, error)
+
+	// Close allows the group plugin to cleanup resources on shutdown.
+	Close() error
 }
 
 // Factory is a function that creates a new plugin instance.

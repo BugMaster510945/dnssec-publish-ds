@@ -1,8 +1,7 @@
 package core
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/miekg/dns"
 
+	"gitlab.syshawk.com/planchon/dnssec-publish-ds/internal/core/helpers"
 	"gitlab.syshawk.com/planchon/dnssec-publish-ds/internal/plugin"
 )
 
@@ -32,8 +32,7 @@ func NewDNSClient(timeout time.Duration) (*DNSClient, error) {
 	return &DNSClient{timeout: timeout, servers: servers}, nil
 }
 
-// query performs a DNSSEC-validated DNS query and returns the answer section.
-func (c *DNSClient) query(name string, qtype uint16) ([]dns.RR, error) {
+func (c *DNSClient) queryInternal(ctx context.Context, name string, qtype uint16, requireAD bool) ([]dns.RR, error) {
 	if !strings.HasSuffix(name, ".") {
 		name += "."
 	}
@@ -49,161 +48,77 @@ func (c *DNSClient) query(name string, qtype uint16) ([]dns.RR, error) {
 		return nil, fmt.Errorf("no DNS servers configured for %s %s", name, dns.TypeToString[qtype])
 	}
 
-	var reasons []string
-	for _, server := range c.servers {
-		r, _, err := client.Exchange(m, server)
-		if err != nil {
-			reasons = append(reasons, fmt.Sprintf("%s: exchange failed: %v", server, err))
-			continue
-		}
-		if r.Rcode != dns.RcodeSuccess {
-			reasons = append(reasons, fmt.Sprintf("%s: rcode %s", server, dns.RcodeToString[r.Rcode]))
-			continue
-		}
-		if !r.AuthenticatedData {
-			reasons = append(reasons, fmt.Sprintf("%s: AD flag not set", server))
-			continue
-		}
-		return r.Answer, nil
-	}
-	return nil, fmt.Errorf("no DNSSEC-validated response for %s %s (%s)", name, dns.TypeToString[qtype], strings.Join(reasons, "; "))
-}
-
-// queryNoADCheck retrieves a DNS response without requiring AD flag.
-// Used as fallback for zones where authoritative server doesn't validate.
-func (c *DNSClient) queryNoADCheck(name string, qtype uint16) ([]dns.RR, error) {
-	if !strings.HasSuffix(name, ".") {
-		name += "."
-	}
-
-	m := new(dns.Msg)
-	m.SetQuestion(name, qtype)
-	m.SetEdns0(4096, true) // DO flag for DNSSEC records
-	m.RecursionDesired = true
-
-	client := &dns.Client{Timeout: c.timeout}
-
-	if len(c.servers) == 0 {
-		return nil, fmt.Errorf("no DNS servers configured for %s %s", name, dns.TypeToString[qtype])
-	}
-
 	var lastErr error
 	for _, server := range c.servers {
-		r, _, err := client.Exchange(m, server)
+		r, _, err := client.ExchangeContext(ctx, m, server)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		if r.Rcode != dns.RcodeSuccess {
-			lastErr = fmt.Errorf("rcode %s", dns.RcodeToString[r.Rcode])
+			lastErr = fmt.Errorf("%s: rcode %s", server, dns.RcodeToString[r.Rcode])
+			continue
+		}
+		if requireAD && !r.AuthenticatedData {
+			lastErr = fmt.Errorf("%s: AD flag not set", server)
 			continue
 		}
 		return r.Answer, nil
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no response from any server")
+
+	if lastErr != nil {
+		return nil, lastErr
 	}
-	return nil, fmt.Errorf("unable to retrieve %s %s: %w", name, dns.TypeToString[qtype], lastErr)
+
+	return nil, fmt.Errorf("no valid response from any server for %s %s", name, dns.TypeToString[qtype])
+}
+
+func queryTyped[T dns.RR](c *DNSClient, ctx context.Context, zone string, qtype uint16, requireAD bool) ([]T, error) {
+	rrs, err := c.queryInternal(ctx, zone, qtype, requireAD)
+	if err != nil {
+		return nil, err
+	}
+	return helpers.ExtractRR[T](rrs), nil
 }
 
 // QueryCDNSKEY returns the CDNSKEY records for a zone.
-func (c *DNSClient) QueryCDNSKEY(zone string) ([]*dns.CDNSKEY, error) {
-	rrs, err := c.query(zone, dns.TypeCDNSKEY)
-	if err != nil {
-		return nil, err
-	}
-	var keys []*dns.CDNSKEY
-	for _, rr := range rrs {
-		if k, ok := rr.(*dns.CDNSKEY); ok {
-			keys = append(keys, k)
-		}
-	}
-	return keys, nil
+func (c *DNSClient) QueryCDNSKEY(ctx context.Context, zone string) ([]*dns.CDNSKEY, error) {
+	return queryTyped[*dns.CDNSKEY](c, ctx, zone, dns.TypeCDNSKEY, true)
 }
 
 // queryCDNSKEYNoADCheck returns CDNSKEY records without AD requirement.
-func (c *DNSClient) queryCDNSKEYNoADCheck(zone string) ([]*dns.CDNSKEY, error) {
-	rrs, err := c.queryNoADCheck(zone, dns.TypeCDNSKEY)
-	if err != nil {
-		return nil, err
-	}
-	var keys []*dns.CDNSKEY
-	for _, rr := range rrs {
-		if k, ok := rr.(*dns.CDNSKEY); ok {
-			keys = append(keys, k)
-		}
-	}
-	return keys, nil
+func (c *DNSClient) queryCDNSKEYNoADCheck(ctx context.Context, zone string) ([]*dns.CDNSKEY, error) {
+	return queryTyped[*dns.CDNSKEY](c, ctx, zone, dns.TypeCDNSKEY, false)
 }
 
 // QueryCDS returns the CDS records for a zone.
-func (c *DNSClient) QueryCDS(zone string) ([]*dns.CDS, error) {
-	rrs, err := c.query(zone, dns.TypeCDS)
-	if err != nil {
-		return nil, err
-	}
-	var cds []*dns.CDS
-	for _, rr := range rrs {
-		if c, ok := rr.(*dns.CDS); ok {
-			cds = append(cds, c)
-		}
-	}
-	return cds, nil
+func (c *DNSClient) QueryCDS(ctx context.Context, zone string) ([]*dns.CDS, error) {
+	return queryTyped[*dns.CDS](c, ctx, zone, dns.TypeCDS, true)
 }
 
 // queryCDSNoADCheck returns CDS records without AD requirement.
-func (c *DNSClient) queryCDSNoADCheck(zone string) ([]*dns.CDS, error) {
-	rrs, err := c.queryNoADCheck(zone, dns.TypeCDS)
-	if err != nil {
-		return nil, err
-	}
-	var cds []*dns.CDS
-	for _, rr := range rrs {
-		if cd, ok := rr.(*dns.CDS); ok {
-			cds = append(cds, cd)
-		}
-	}
-	return cds, nil
+func (c *DNSClient) queryCDSNoADCheck(ctx context.Context, zone string) ([]*dns.CDS, error) {
+	return queryTyped[*dns.CDS](c, ctx, zone, dns.TypeCDS, false)
 }
 
 // QueryDS returns the DS records for a zone (queried from the parent zone).
-func (c *DNSClient) QueryDS(zone string) ([]*dns.DS, error) {
-	rrs, err := c.query(zone, dns.TypeDS)
-	if err != nil {
-		return nil, err
-	}
-	var ds []*dns.DS
-	for _, rr := range rrs {
-		if d, ok := rr.(*dns.DS); ok {
-			ds = append(ds, d)
-		}
-	}
-	return ds, nil
+func (c *DNSClient) QueryDS(ctx context.Context, zone string) ([]*dns.DS, error) {
+	return queryTyped[*dns.DS](c, ctx, zone, dns.TypeDS, true)
 }
 
 // QueryDNSKEY returns the DNSKEY records for a zone without AD requirement.
-func (c *DNSClient) QueryDNSKEY(zone string) ([]*dns.DNSKEY, error) {
-	rrs, err := c.queryNoADCheck(zone, dns.TypeDNSKEY)
-	if err != nil {
-		return nil, err
-	}
-	var keys []*dns.DNSKEY
-	for _, rr := range rrs {
-		if k, ok := rr.(*dns.DNSKEY); ok {
-			keys = append(keys, k)
-		}
-	}
-	return keys, nil
+func (c *DNSClient) QueryDNSKEY(ctx context.Context, zone string) ([]*dns.DNSKEY, error) {
+	return queryTyped[*dns.DNSKEY](c, ctx, zone, dns.TypeDNSKEY, false)
 }
 
 // validateDNSSECChain validates zone keys via local DNSSEC chain verification
 // (DS parent + DNSKEY + CDNSKEY/CDS signatures).
 // Used as fallback when AD flag unavailable on authoritative server.
-func (c *DNSClient) validateDNSSECChain(zone string) ([]plugin.KeyRecord, bool, error) {
+func (c *DNSClient) validateDNSSECChain(ctx context.Context, zone string) ([]plugin.KeyRecord, bool, error) {
 	slog.Debug("DNSSEC fallback: attempting local chain validation", "zone", zone)
 
 	// Step 1: Fetch DS from parent (AD required for trust anchor)
-	parentDS, err := c.QueryDS(zone)
+	parentDS, err := c.QueryDS(ctx, zone)
 	if err != nil {
 		return nil, false, fmt.Errorf("fetching parent DS: %w", err)
 	}
@@ -213,7 +128,7 @@ func (c *DNSClient) validateDNSSECChain(zone string) ([]plugin.KeyRecord, bool, 
 	slog.Debug("DNSSEC fallback: fetched parent DS records", "zone", zone, "count", len(parentDS))
 
 	// Step 2: Fetch DNSKEY from zone (no AD requirement)
-	dnskeys, err := c.QueryDNSKEY(zone)
+	dnskeys, err := c.QueryDNSKEY(ctx, zone)
 	if err != nil {
 		return nil, false, fmt.Errorf("fetching DNSKEY: %w", err)
 	}
@@ -227,7 +142,7 @@ func (c *DNSClient) validateDNSSECChain(zone string) ([]plugin.KeyRecord, bool, 
 	for _, key := range dnskeys {
 		if key.Flags&257 == 257 { // KSK flag
 			for _, ds := range parentDS {
-				computedDigest := computeDSDigestFromDNSKEY(zone, key, ds.DigestType)
+				computedDigest := dsDigest(zone, key.Flags, key.Protocol, key.Algorithm, key.PublicKey, ds.DigestType)
 				if strings.EqualFold(computedDigest, ds.Digest) {
 					validKSK = key
 					slog.Debug("DNSSEC fallback: found KSK matching parent DS", "zone", zone, "key_tag", key.KeyTag(), "ds_digest_type", ds.DigestType)
@@ -244,8 +159,8 @@ func (c *DNSClient) validateDNSSECChain(zone string) ([]plugin.KeyRecord, bool, 
 	}
 
 	// Step 4: Fetch CDNSKEY/CDS (no AD requirement) and verify
-	cdnskeys, cdnskeyErr := c.queryCDNSKEYNoADCheck(zone)
-	cdsRecords, cdsErr := c.queryCDSNoADCheck(zone)
+	cdnskeys, cdnskeyErr := c.queryCDNSKEYNoADCheck(ctx, zone)
+	cdsRecords, cdsErr := c.queryCDSNoADCheck(ctx, zone)
 
 	hasCDNSKEY := cdnskeyErr == nil && len(cdnskeys) > 0
 	hasCDS := cdsErr == nil && len(cdsRecords) > 0
@@ -294,9 +209,9 @@ func (c *DNSClient) validateDNSSECChain(zone string) ([]plugin.KeyRecord, bool, 
 // CDNSKEY over CDS. Returns the key records and whether the zone requests
 // DNSSEC removal (sentinel algorithm 0).
 // Falls back to local DNSSEC chain validation if AD flag unavailable.
-func (c *DNSClient) FetchZoneKeys(zone string) ([]plugin.KeyRecord, bool, error) {
-	cdnskeys, cdnskeyErr := c.QueryCDNSKEY(zone)
-	cdsRecords, cdsErr := c.QueryCDS(zone)
+func (c *DNSClient) FetchZoneKeys(ctx context.Context, zone string) ([]plugin.KeyRecord, bool, error) {
+	cdnskeys, cdnskeyErr := c.QueryCDNSKEY(ctx, zone)
+	cdsRecords, cdsErr := c.QueryCDS(ctx, zone)
 
 	hasCDNSKEY := cdnskeyErr == nil && len(cdnskeys) > 0
 	hasCDS := cdsErr == nil && len(cdsRecords) > 0
@@ -309,7 +224,7 @@ func (c *DNSClient) FetchZoneKeys(zone string) ([]plugin.KeyRecord, bool, error)
 		if cdnskeyNoAD || cdsNoAD {
 			slog.Debug("AD validation unavailable; attempting DNSSEC fallback", "zone", zone)
 			// Attempt fallback: local DNSSEC chain validation
-			keys, isSentinel, fallbackErr := c.validateDNSSECChain(zone)
+			keys, isSentinel, fallbackErr := c.validateDNSSECChain(ctx, zone)
 			if fallbackErr == nil {
 				// Fallback succeeded
 				slog.Info("DNSSEC validation via fallback chain", "zone", zone)
@@ -394,7 +309,7 @@ func buildFromCDNSKEY(zone string, keys []*dns.CDNSKEY, cdsRecords []*dns.CDS) [
 		} else {
 			// Compute DS (SHA-256) from CDNSKEY
 			digestType = dns.SHA256
-			digest = computeDSDigest(zone, k, dns.SHA256)
+			digest = dsDigest(zone, k.Flags, k.Protocol, k.Algorithm, k.PublicKey, dns.SHA256)
 		}
 
 		records = append(records, plugin.KeyRecord{
@@ -424,8 +339,8 @@ func buildFromCDS(cdsRecords []*dns.CDS) []plugin.KeyRecord {
 	return records
 }
 
-// computeDSDigest computes a DS digest from a CDNSKEY record.
-func computeDSDigest(zone string, key *dns.CDNSKEY, digestType uint8) string {
+// dsDigest computes a DS digest from DNSKEY fields.
+func dsDigest(zone string, flags uint16, protocol uint8, algorithm uint8, publicKey string, digestType uint8) string {
 	if !strings.HasSuffix(zone, ".") {
 		zone += "."
 	}
@@ -433,10 +348,10 @@ func computeDSDigest(zone string, key *dns.CDNSKEY, digestType uint8) string {
 	// Build the DNSKEY wire format for hashing
 	dnskey := &dns.DNSKEY{
 		Hdr:       dns.RR_Header{Name: zone, Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET},
-		Flags:     key.Flags,
-		Protocol:  key.Protocol,
-		Algorithm: key.Algorithm,
-		PublicKey: key.PublicKey,
+		Flags:     flags,
+		Protocol:  protocol,
+		Algorithm: algorithm,
+		PublicKey: publicKey,
 	}
 
 	ds := dnskey.ToDS(digestType)
@@ -445,68 +360,3 @@ func computeDSDigest(zone string, key *dns.CDNSKEY, digestType uint8) string {
 	}
 	return ds.Digest
 }
-
-// computeDSDigestFromDNSKEY computes a DS digest from a DNSKEY record.
-func computeDSDigestFromDNSKEY(zone string, key *dns.DNSKEY, digestType uint8) string {
-	if !strings.HasSuffix(zone, ".") {
-		zone += "."
-	}
-
-	// Build the DNSKEY wire format for hashing
-	dnskey := &dns.DNSKEY{
-		Hdr:       dns.RR_Header{Name: zone, Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET},
-		Flags:     key.Flags,
-		Protocol:  key.Protocol,
-		Algorithm: key.Algorithm,
-		PublicKey: key.PublicKey,
-	}
-
-	ds := dnskey.ToDS(digestType)
-	if ds == nil {
-		return ""
-	}
-	return ds.Digest
-}
-
-// CompareDS checks whether the current DS records match the desired keys.
-// Returns lists of keys to add and remove.
-func CompareDS(current []*dns.DS, desired []plugin.KeyRecord) (toAdd, toRemove []plugin.KeyRecord) {
-	type dsID struct {
-		Tag        uint16
-		Algorithm  uint8
-		DigestType uint8
-		Digest     string
-	}
-
-	currentSet := make(map[dsID]bool)
-	for _, d := range current {
-		currentSet[dsID{d.KeyTag, d.Algorithm, d.DigestType, strings.ToUpper(d.Digest)}] = true
-	}
-
-	desiredSet := make(map[dsID]bool)
-	for _, d := range desired {
-		id := dsID{d.Tag, d.Algorithm, d.DigestType, strings.ToUpper(d.Digest)}
-		desiredSet[id] = true
-		if !currentSet[id] {
-			toAdd = append(toAdd, d)
-		}
-	}
-
-	for _, d := range current {
-		id := dsID{d.KeyTag, d.Algorithm, d.DigestType, strings.ToUpper(d.Digest)}
-		if !desiredSet[id] {
-			toRemove = append(toRemove, plugin.KeyRecord{
-				Tag:        d.KeyTag,
-				Algorithm:  d.Algorithm,
-				DigestType: d.DigestType,
-				Digest:     d.Digest,
-			})
-		}
-	}
-
-	return toAdd, toRemove
-}
-
-// Unused but reserved for future digest computation without miekg/dns helpers.
-var _ = sha256.New
-var _ = hex.EncodeToString

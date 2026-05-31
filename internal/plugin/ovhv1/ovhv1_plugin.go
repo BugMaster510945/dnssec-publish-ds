@@ -81,37 +81,17 @@ func (p *OVHv1Plugin) Init(globalCfg map[string]any, logger *slog.Logger) error 
 }
 
 func (p *OVHv1Plugin) NewGroup(groupName string, cfg map[string]any) (plugin.GroupPlugin, error) {
-	if _, ok := cfg["max_concurrency"]; ok {
-		return nil, fmt.Errorf(
-			"%s: max_concurrency must be configured in [plugins.\"%s\"], not in [group.%s.plugin_config]",
-			pluginName,
-			pluginName,
-			groupName,
-		)
-	}
-	if _, ok := cfg["wait_submit"]; ok {
-		return nil, fmt.Errorf(
-			"%s: wait_submit must be configured in [plugins.\"%s\"], not in [group.%s.plugin_config]",
-			pluginName,
-			pluginName,
-			groupName,
-		)
-	}
-	if _, ok := cfg["wait_poll_urgent"]; ok {
-		return nil, fmt.Errorf(
-			"%s: wait_poll_urgent must be configured in [plugins.\"%s\"], not in [group.%s.plugin_config]",
-			pluginName,
-			pluginName,
-			groupName,
-		)
-	}
-	if _, ok := cfg["wait_poll_passive"]; ok {
-		return nil, fmt.Errorf(
-			"%s: wait_poll_passive must be configured in [plugins.\"%s\"], not in [group.%s.plugin_config]",
-			pluginName,
-			pluginName,
-			groupName,
-		)
+	forbidden := []string{"max_concurrency", "wait_submit", "wait_poll_urgent", "wait_poll_passive"}
+	for _, k := range forbidden {
+		if _, ok := cfg[k]; ok {
+			return nil, fmt.Errorf(
+				"%s: %s must be configured in [plugins.\"%s\"], not in [group.%s.plugin_config]",
+				pluginName,
+				k,
+				pluginName,
+				groupName,
+			)
+		}
 	}
 
 	endpoint, _ := cfg["endpoint"].(string)

@@ -15,6 +15,7 @@ import (
 
 	// Register plugins
 	_ "gitlab.syshawk.com/planchon/dnssec-publish-ds/internal/plugin/ovhv1"
+	_ "gitlab.syshawk.com/planchon/dnssec-publish-ds/internal/plugin/rfc2136"
 )
 
 // Engine is the main daemon controller.
@@ -124,6 +125,24 @@ func (e *Engine) runOnce() (bool, error) {
 	// Cancel all zone goroutines
 	cancel()
 	wg.Wait()
+
+	// Ask group plugins to cleanup.
+	for name, gp := range groupPlugins {
+		if err := gp.Close(); err != nil {
+			slog.Error("group plugin Close() failed", "group", name, "error", err)
+		} else {
+			slog.Info("group plugin closed", "group", name)
+		}
+	}
+
+	// Ask global plugins to cleanup.
+	for name, p := range pluginGlobals {
+		if err := p.Close(); err != nil {
+			slog.Error("global plugin Close() failed", "plugin", name, "error", err)
+		} else {
+			slog.Info("global plugin closed", "plugin", name)
+		}
+	}
 
 	// Save status before exiting
 	if err := store.Save(); err != nil {

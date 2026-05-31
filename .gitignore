@@ -8,6 +8,8 @@
 
 # Generated manpage archive
 /man/*.gz
+/man/xymon-ext-dnssec.1
+/man/dnssec-publish-ds.8
 
 # Debian helper/generated files
 debian/debhelper-build-stamp

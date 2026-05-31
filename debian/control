@@ -4,6 +4,7 @@ Priority: optional
 Maintainer: Frédéric Planchon <syshawk@planchon.org>
 Build-Depends: debhelper-compat (= 13),
  dh-golang,
+ mmark,
  golang-any (>= 2:1.24~),
  golang-github-miekg-dns-dev,
  golang-github-ovh-go-ovh-dev,

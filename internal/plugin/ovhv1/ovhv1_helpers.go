@@ -61,6 +61,8 @@ func isDNSSECTask(taskFunction string) bool {
 }
 
 func buildDesiredKeys(current map[int]ovhKey, req plugin.UpdateRequest) ([]ovhKey, int, int) {
+	added := 0
+	removed := 0
 	desiredByCanonical := make(map[string]ovhKey, len(current))
 	for _, key := range current {
 		desiredByCanonical[canonicalOVHKey(key)] = key
@@ -70,6 +72,7 @@ func buildDesiredKeys(current map[int]ovhKey, req plugin.UpdateRequest) ([]ovhKe
 		needle := tagAlgoKey(remove.Tag, remove.Algorithm)
 		for canonical, key := range desiredByCanonical {
 			if tagAlgoKeyFromOVH(key) == needle {
+				removed++
 				delete(desiredByCanonical, canonical)
 			}
 		}
@@ -85,34 +88,23 @@ func buildDesiredKeys(current map[int]ovhKey, req plugin.UpdateRequest) ([]ovhKe
 			PublicKey: *add.PublicKey,
 			Tag:       int(add.Tag),
 		}
-		desiredByCanonical[canonicalOVHKey(newKey)] = newKey
-	}
-
-	currentByCanonical := make(map[string]struct{}, len(current))
-	for _, key := range current {
-		currentByCanonical[canonicalOVHKey(key)] = struct{}{}
-	}
-
-	added := 0
-	for canonical := range desiredByCanonical {
-		if _, ok := currentByCanonical[canonical]; !ok {
-			added++
+		can := canonicalOVHKey(newKey)
+		if _, exists := desiredByCanonical[can]; exists {
+			// key already present — nothing to do
+			continue
 		}
+		added++
+		desiredByCanonical[can] = newKey
 	}
 
-	removed := 0
-	for canonical := range currentByCanonical {
-		if _, ok := desiredByCanonical[canonical]; !ok {
-			removed++
-		}
-	}
-
+	// Récupère la liste des id de clés et les tries
 	canonicalKeys := make([]string, 0, len(desiredByCanonical))
 	for canonical := range desiredByCanonical {
 		canonicalKeys = append(canonicalKeys, canonical)
 	}
 	sort.Strings(canonicalKeys)
 
+	// Ordonne la sortie selon les id de clés triés
 	desired := make([]ovhKey, 0, len(desiredByCanonical))
 	for _, canonical := range canonicalKeys {
 		desired = append(desired, desiredByCanonical[canonical])

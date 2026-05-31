@@ -24,11 +24,11 @@ type fakeZoneDNS struct {
 	queryDSCalls int
 }
 
-func (f *fakeZoneDNS) FetchZoneKeys(zone string) ([]plugin.KeyRecord, bool, error) {
+func (f *fakeZoneDNS) FetchZoneKeys(ctx context.Context, zone string) ([]plugin.KeyRecord, bool, error) {
 	return f.keys, f.isRem, f.keysErr
 }
 
-func (f *fakeZoneDNS) QueryDS(zone string) ([]*dns.DS, error) {
+func (f *fakeZoneDNS) QueryDS(ctx context.Context, zone string) ([]*dns.DS, error) {
 	f.queryDSCalls++
 	return f.ds, f.dsErr
 }
@@ -68,6 +68,8 @@ func (f *fakePlugin) Update(ctx context.Context, req plugin.UpdateRequest) (plug
 	}
 	return f.updateResult, nil
 }
+
+func (f *fakePlugin) Close() error { return nil }
 
 func newTestStore(t *testing.T) *status.Store {
 	t.Helper()

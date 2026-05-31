@@ -17,8 +17,6 @@ const (
 	defaultWaitPollPassive = 5 * time.Minute
 )
 
-// No longer needed - states are simplified
-
 // OVHv1Plugin is the global plugin object for OVH v1.
 type OVHv1Plugin struct {
 	log             *slog.Logger
@@ -66,3 +64,7 @@ type ovhTask struct {
 type ovhMe struct {
 	Nichandle string `json:"nichandle"`
 }
+
+func (p *OVHv1Plugin) Close() error { return nil }
+
+func (g *OVHv1Group) Close() error { return nil }
