@@ -10,6 +10,7 @@ use Net::DNS::RR::DNSKEY;
 use Net::DNS::SEC;
 use YAML::Tiny;
 use Storable qw(dclone nstore retrieve);
+use List::Util qw(min);
 use Data::Dumper;
 use Time::HiRes qw(time);
 
@@ -117,6 +118,7 @@ sub main {
 
         $ctx{zone} = $entry->{zone};
         $ctx{bb} = $bb;
+        $ctx{trends} = Hobbit::trends($entry->{zone});
         $ctx{recursive} = $recursive;
         $ctx{cfg} = merge_zone_options($cfg, $entry->{options});
         $ctx{debug} = $debug;
@@ -144,6 +146,7 @@ sub main {
         if ($bb->{color} eq 'green') {
             $cache->{ $ctx{zone} } = $ctx{zone_cache};
         }
+        $ctx{trends}->send();
         $bb->send();
     }
 
@@ -248,6 +251,14 @@ sub parse_zone_options {
     my ($raw) = @_;
     return {} if !defined $raw || $raw eq q{};
 
+    my %OPT_MAP = (
+        permanent_cds_cdnskey    => sub { ('require_permanent_cds_cdnskey', parse_bool_option_value($_[0])) },
+        no_permanent_cds_cdnskey => sub { ('require_permanent_cds_cdnskey', !parse_bool_option_value($_[0])) },
+        strip                    => sub { ('parent_strip_labels',           int($_[0])) },
+        nsec3                    => sub { ('warn_if_no_nsec3',              parse_bool_option_value($_[0])) },
+        nsec                     => sub { ('warn_if_no_nsec3',              !parse_bool_option_value($_[0])) },
+    );
+
     my %opts;
     for my $item (split /,/, lc($raw)) {
         $item =~ s/^\s+|\s+$//g;
@@ -258,24 +269,7 @@ sub parse_zone_options {
             ($k, $v) = ($1, $2);
         }
 
-
-        $k = 'require_permanent_cds_cdnskey' if $k eq 'permanent_cds_cdnskey';
-        $v = parse_bool_option_value($v) if $k eq 'require_permanent_cds_cdnskey';
-
-        if($k eq 'no_permanent_cds_cdnskey') {
-            $k = 'require_permanent_cds_cdnskey';
-            $v = !parse_bool_option_value($v);
-        }
-
-        $k = 'parent_strip_labels' if $k eq 'strip';
-        $v = int($v) if $k eq 'parent_strip_labels';
-
-        $k = 'warn_if_no_nsec3' if $k eq 'nsec3';
-        $v = parse_bool_option_value($v) if $k eq 'warn_if_no_nsec3';
-        if($k eq 'nsec') {
-            $k = 'warn_if_no_nsec3';
-            $v = !parse_bool_option_value($v);
-        }
+        ($k, $v) = $OPT_MAP{$k}->($v) if exists $OPT_MAP{$k};     
 
         $opts{$k} = $v;
     }
@@ -346,6 +340,10 @@ sub run_zone_checks {
         my ($data, $data_err) = fetch_zone_state_from_server($ctx, $name, $ips);
         next if redwarn_error($ctx, $data_err, "Failed to fetch zone state from %s: %s", $name, $data_err);
         $data->{time} = time() - $t0;
+
+        (my $rrd_ns = $name) =~ s/,/_/g;
+        $ctx->{trends}->sprintf("[dnssec,nstime,%s.rrd]\n", $rrd_ns);
+        $ctx->{trends}->sprintf("DS:elapsed:GAUGE:600:U:U %.6f\n", $data->{time});
 
         $ns_passed++ if run_ns_checks($ctx, $ns, $data);
     }
@@ -540,23 +538,14 @@ sub discover_parent_ns {
     my %additional_ips;
     for my $rr ($packet->additional) {
         next unless $rr->type eq 'A' || $rr->type eq 'AAAA';
-        my $host = lc($rr->name);
-        $host =~ s/\.+$//;
-        push @{ $additional_ips{$host} }, $rr->address;
+        push @{ $additional_ips{ lc($rr->name) =~ s/\.+$//r } }, $rr->address;
     }
 
-    # Collect all parent NS IPs (additional first, then fallback resolve)
-    my @all_ips;
-    for my $ns (@$ns_rrs) {
-        my $host = lc($ns->nsdname);
-        $host =~ s/\.+$//;
-        if (exists $additional_ips{$host} && @{ $additional_ips{$host} }) {
-            push @all_ips, @{ $additional_ips{$host} };
-        } else {
-            my $resolved = resolve_host_ips($ctx, $ctx->{recursive}, $host);
-            push @all_ips, @$resolved;
-        }
-    }
+        # Collect all parent NS IPs (additional first, then fallback resolve)
+    my @all_ips = map {
+        my $h = lc($_->nsdname) =~ s/\.+$//r;
+        @{ $additional_ips{$h} || resolve_host_ips($ctx, $ctx->{recursive}, $h) }
+    } @$ns_rrs;
 
     return \@all_ips;
 }
@@ -597,14 +586,7 @@ sub fetch_delegation_from_parent {
     my $ds_list_ref = $ds_rrs // \@ds_rrs;
 
     # Compute a conservative min TTL from delegation NS and additional records
-    my $min_ttl;
-    for my $rr (@ns_rrs) {
-        $min_ttl = $rr->ttl if !defined $min_ttl || $rr->ttl < $min_ttl;
-    }
-    for my $rr ($ns_packet->additional) {
-        next unless $rr->type eq 'A' || $rr->type eq 'AAAA';
-        $min_ttl = $rr->ttl if !defined $min_ttl || $rr->ttl < $min_ttl;
-    }
+    my $min_ttl = min(map { $_->ttl } (@ns_rrs, grep { $_->type =~ /^A(?:AAA)?$/ } $ns_packet->additional));
     my $expiry = time() + ($min_ttl || $ctx->{cfg}->{cache_default_ttl} || 3600);
 
     # Populate zone-local cache in context (serialized as strings)
@@ -740,21 +722,14 @@ sub bbprint {
     $bb->sprintf($fmt . "\n", @args);
 }
 
-sub check_error {
-    my ($ctx, $err, $fmt, @args) = @_;
-    return $err unless $ctx && ref $ctx eq 'HASH';
+sub _signal_error {
+    my ($ctx, $color, $err, $fmt, @args) = @_;
     return $err unless $err;
-    color_line($ctx, 'red', $fmt, @args);
+    color_line($ctx, $color, $fmt, @args);
     return $err;
 }
-
-sub warn_error {
-    my ($ctx, $err, $fmt, @args) = @_;
-    return $err unless $ctx && ref $ctx eq 'HASH';
-    return $err unless $err;
-    color_line($ctx, 'yellow', $fmt, @args);
-    return $err;
-}
+sub check_error { _signal_error($_[0], 'red',    @_[1..$#_]) }
+sub warn_error  { _signal_error($_[0], 'yellow', @_[1..$#_]) }
 
 sub redwarn_error {
     my ($ctx, $err, $fmt, @args) = @_;
@@ -833,15 +808,15 @@ sub check_rrsig_on_rrset {
 
         # 1. Le signataire doit exister dans le DNSKEY set
         $ok = 0 if !$signer;
-        next if redwarn_error($ctx, !$signer, "RRSIG(%s) keytag=%d references unknown DNSKEY", $rrtype, $keytag);
+        next if check_error($ctx, !$signer, "RRSIG(%s) keytag=%d references unknown DNSKEY", $rrtype, $keytag);
 
         # 2. Validation cryptographique
         my $valid = eval { $rrsig->verify($rrset_rrs, $signer) };
         $ok = 0 if $@;
-        next if redwarn_error($ctx, $@, "RRSIG(%s) keytag=%d crypto error: %s", $rrtype, $keytag, $@);
+        next if check_error($ctx, $@, "RRSIG(%s) keytag=%d crypto error: %s", $rrtype, $keytag, $@);
 
         $ok = 0 if !$valid;
-        next if redwarn_error($ctx, !$valid, "RRSIG(%s) keytag=%d signature invalid", $rrtype, $keytag);
+        next if check_error($ctx, !$valid, "RRSIG(%s) keytag=%d signature invalid", $rrtype, $keytag);
 
         # 3. Expiration imminente : now + TTL > sigexpiration → le cache peut distribuer une sig expirée
         my $ttl        = ($rrset_rrs && @$rrset_rrs) ? $rrset_rrs->[0]->ttl : 0;
@@ -858,10 +833,10 @@ sub check_rrsig_on_rrset {
         if ($require_ksk_signer) {
             # DNSKEY/CDS/CDNSKEY : le signataire doit être une KSK référencée dans les DS
             if (!$is_ksk) {
-                color_line($ctx, 'yellow', "RRSIG(%s) keytag=%d: signer is not a KSK", $rrtype, $keytag);
+                color_line($ctx, 'red', "RRSIG(%s) keytag=%d: signer is not a KSK", $rrtype, $keytag);
                 $ok = 0;
             } elsif (!$ksks_in_ds->{$keytag}) {
-                color_line($ctx, 'yellow', "RRSIG(%s) keytag=%d: KSK not covered by any DS", $rrtype, $keytag);
+                color_line($ctx, 'red', "RRSIG(%s) keytag=%d: KSK not covered by any DS", $rrtype, $keytag);
                 $ok = 0;
             } else {
                 debug($ctx, "RRSIG(%s) keytag=%d: signed by KSK in DS, valid, expires in %ds",
@@ -872,7 +847,7 @@ sub check_rrsig_on_rrset {
             if ($is_ksk) {
                 # KSK doit être dans les DS
                 if (!$ksks_in_ds->{$keytag}) {
-                    color_line($ctx, 'yellow', "RRSIG(%s) keytag=%d: KSK not covered by any DS", $rrtype, $keytag);
+                    color_line($ctx, 'red', "RRSIG(%s) keytag=%d: KSK not covered by any DS", $rrtype, $keytag);
                     $ok = 0;
                 } else {
                     debug($ctx, "RRSIG(%s) keytag=%d: signed by KSK in DS, valid, expires in %ds",
@@ -883,7 +858,7 @@ sub check_rrsig_on_rrset {
                 # La ZSK est deja validé par un signer KSK grace a la validation des DNSKEY (RRSIG)
                 # et la présence de toutes les DNSKEY dans dnskey_by_tag
                 if (!%$ksks_in_ds) {
-                    color_line($ctx, 'yellow',
+                    color_line($ctx, 'red',
                         "RRSIG(%s) keytag=%d: signed by ZSK but no trusted KSK found in zone",
                         $rrtype, $keytag);
                     $ok = 0;
