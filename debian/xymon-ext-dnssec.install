@@ -1,5 +1,5 @@
 xymon/server/ext/xymon-ext-dnssec usr/lib/xymon/server/ext/
 xymon/server/etc/xymon-ext-dnssec.cfg etc/xymon/tasks.d/
-xymon/server/etc/graphs.d/dnssec-ns-time.cfg etc/xymon/graphs.d/
+xymon/server/etc/graphs.d/xymon-ext-dnssec.cfg etc/xymon/graphs.d/
 xymon/server/etc/xymonserver.d/xymon-ext-dnssec.cfg etc/xymon/xymonserver.d/
 config/xymon-ext-dnssec.yaml usr/share/doc/xymon-ext-dnssec/examples/
