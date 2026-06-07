@@ -17,6 +17,16 @@ use Time::HiRes qw(time);
 # Package Guard permet d'emuler le defer en go
 { package Guard; sub new { bless \$_[1], $_[0] } sub DESTROY { ${$_[0]}->() } }
 
+# Tampon de sortie Hobbit : capture color_line/add_color pour rejeu conditionnel.
+# sprintf est un passthrough direct vers le vrai bb (pour debug()). Ne fonctionnera pas avec redwarn_error
+{ package _BBBuffer;
+  sub new        { bless { buf => [], real_bb => $_[1] }, $_[0] }
+  sub color_line { push @{$_[0]->{buf}}, ['color_line', @_[1..$#_]] }
+  sub sprintf    { $_[0]->{real_bb}->sprintf(@_[1..$#_]) }
+  sub add_color  { push @{$_[0]->{buf}}, ['add_color',  @_[1..$#_]] }
+  sub _replay    { my ($self, $bb) = @_; for my $e (@{$self->{buf}}) { my $m = $e->[0]; $bb->$m(@{$e}[1..$#$e]) } }
+}
+
 my %DEFAULTS = (
     resolver_timeout    => 5,
     zone_warn_if_no_nsec3 => 1,
@@ -399,6 +409,7 @@ sub build_authoritative_resolver {
     if ($server_options && ref $server_options eq 'HASH' && $server_options->{tsig}) {
         my $tsig = $server_options->{tsig};
         if ($tsig->{name} && $tsig->{secret}) {
+            debug($ctx, "Using TSIG for server %s: key name=%s, algorithm=%s", $server_name, $tsig->{name}, $tsig->{algorithm});
             # Vilain hack pour affecter la variable de tsig car tsig() ne fait le job qu'avec un fichier
             $r->{tsig_rr} = 
                 Net::DNS::RR->new(
@@ -541,7 +552,7 @@ sub discover_parent_ns {
         push @{ $additional_ips{ lc($rr->name) =~ s/\.+$//r } }, $rr->address;
     }
 
-        # Collect all parent NS IPs (additional first, then fallback resolve)
+    # Collect all parent NS IPs (additional first, then fallback resolve)
     my @all_ips = map {
         my $h = lc($_->nsdname) =~ s/\.+$//r;
         @{ $additional_ips{$h} || resolve_host_ips($ctx, $ctx->{recursive}, $h) }
@@ -793,39 +804,39 @@ sub check_rrsig_on_rrset {
     my ($ctx, $rrtype, $packet, $rrset_rrs, $data, $require_ksk_signer) = @_;
     return 1 unless defined $packet;
 
-    my $ok = 1;
     my @rrsigs = grep { $_->type eq 'RRSIG' && uc($_->typecovered) eq uc($rrtype) } $packet->answer;
-
-    return 0 if (redwarn_error($ctx, !@rrsigs, "No RRSIG found for %s", $rrtype));
+    return 0 if (check_error($ctx, !@rrsigs, "No RRSIG found for %s", $rrtype));
 
     my $dnskey_by_tag = $data->{_dnskey_by_tag} || {};
     my $ksks_in_ds    = $data->{_ksks_in_ds}    || {};
     my $now = time();
 
+    # Guard restore : rétablit ctx->bb à la sortie de la fonction.
+    # Guard replay  : rejoue le buffer si aucune RRSIG n'a passé.
+    my $real_bb    = $ctx->{bb};
+    my $buf        = _BBBuffer->new($real_bb);
+    my $any_passed = 0;
+    my $guard_restore = Guard->new(sub { $ctx->{bb} = $real_bb });
+    my $guard_replay  = Guard->new(sub { $buf->_replay($real_bb) unless $any_passed });
+    $ctx->{bb} = $buf;
+
     for my $rrsig (@rrsigs) {
-        my $keytag = $rrsig->keytag;
-        my $signer = $dnskey_by_tag->{$keytag};
+        my $rrsig_ok = 1;
+        my $keytag   = $rrsig->keytag;
+        my $signer   = $dnskey_by_tag->{$keytag};
 
         # 1. Le signataire doit exister dans le DNSKEY set
-        $ok = 0 if !$signer;
-        next if check_error($ctx, !$signer, "RRSIG(%s) keytag=%d references unknown DNSKEY", $rrtype, $keytag);
+        do { $rrsig_ok = 0; next; } if check_error($ctx, !$signer, "RRSIG(%s) keytag=%d references unknown DNSKEY", $rrtype, $keytag);
 
         # 2. Validation cryptographique
         my $valid = eval { $rrsig->verify($rrset_rrs, $signer) };
-        $ok = 0 if $@;
-        next if check_error($ctx, $@, "RRSIG(%s) keytag=%d crypto error: %s", $rrtype, $keytag, $@);
-
-        $ok = 0 if !$valid;
-        next if check_error($ctx, !$valid, "RRSIG(%s) keytag=%d signature invalid", $rrtype, $keytag);
+        do { $rrsig_ok = 0; next; } if check_error($ctx, $@, "RRSIG(%s) keytag=%d crypto error: %s", $rrtype, $keytag, $@);
+        do { $rrsig_ok = 0; next; } if check_error($ctx, !$valid, "RRSIG(%s) keytag=%d signature invalid", $rrtype, $keytag);
 
         # 3. Expiration imminente : now + TTL > sigexpiration → le cache peut distribuer une sig expirée
         my $ttl        = ($rrset_rrs && @$rrset_rrs) ? $rrset_rrs->[0]->ttl : 0;
         my $expiration = $rrsig->sigexpiration;
-        if ($now + $ttl > $expiration) {
-            color_line($ctx, 'yellow', "RRSIG(%s) keytag=%d expires in %ds (< TTL %ds): imminent expiry",
-                $rrtype, $keytag, $expiration - $now, $ttl);
-            $ok = 0;
-        }
+        $rrsig_ok = 0 if warn_error($ctx, ($now + $ttl > $expiration), "RRSIG(%s) keytag=%d expires in %ds (< TTL %ds): imminent expiry", $rrtype, $keytag, $expiration - $now, $ttl);
 
         # 4. Validation de la chaîne de confiance par keytag
         my $is_ksk = ($signer->flags & 0x0101) == 0x0101;
@@ -834,10 +845,10 @@ sub check_rrsig_on_rrset {
             # DNSKEY/CDS/CDNSKEY : le signataire doit être une KSK référencée dans les DS
             if (!$is_ksk) {
                 color_line($ctx, 'red', "RRSIG(%s) keytag=%d: signer is not a KSK", $rrtype, $keytag);
-                $ok = 0;
+                $rrsig_ok = 0;
             } elsif (!$ksks_in_ds->{$keytag}) {
                 color_line($ctx, 'red', "RRSIG(%s) keytag=%d: KSK not covered by any DS", $rrtype, $keytag);
-                $ok = 0;
+                $rrsig_ok = 0;
             } else {
                 debug($ctx, "RRSIG(%s) keytag=%d: signed by KSK in DS, valid, expires in %ds",
                     $rrtype, $keytag, $expiration - $now);
@@ -848,7 +859,7 @@ sub check_rrsig_on_rrset {
                 # KSK doit être dans les DS
                 if (!$ksks_in_ds->{$keytag}) {
                     color_line($ctx, 'red', "RRSIG(%s) keytag=%d: KSK not covered by any DS", $rrtype, $keytag);
-                    $ok = 0;
+                    $rrsig_ok = 0;
                 } else {
                     debug($ctx, "RRSIG(%s) keytag=%d: signed by KSK in DS, valid, expires in %ds",
                         $rrtype, $keytag, $expiration - $now);
@@ -861,16 +872,19 @@ sub check_rrsig_on_rrset {
                     color_line($ctx, 'red',
                         "RRSIG(%s) keytag=%d: signed by ZSK but no trusted KSK found in zone",
                         $rrtype, $keytag);
-                    $ok = 0;
+                    $rrsig_ok = 0;
                 } else {
                     debug($ctx, "RRSIG(%s) keytag=%d: signed by ZSK, trusted via KSK chain, valid, expires in %ds",
                         $rrtype, $keytag, $expiration - $now);
                 }
             }
         }
+
+        $any_passed = 1 if $rrsig_ok;
     }
 
-    return $ok;
+    return $any_passed;
+    # Guards détruits ici : $guard_replay rejoue si !$any_passed, $guard_restore rétablit bb
 }
 
 sub check_ds_dnskey_bidirectional {
@@ -899,30 +913,24 @@ sub check_ds_dnskey_bidirectional {
 
         my $algo_num = $ksk->algorithm;
         my $algo_str = $ksk->algorithm('MNEMONIC');
-        if (exists $ksks_in_ds{$ksk->keytag}) {
-            color_line($ctx, 'green', "KSK keytag=%d algo=%d(%s): DS published", $ksk->keytag, $algo_num, $algo_str);
-        } else {
-            color_line($ctx, 'yellow', "KSK keytag=%d algo=%d(%s): no matching DS published", $ksk->keytag, $algo_num, $algo_str);
-            $ok = 0;
-        }
-        if (!$allowed_alg->{$algo_num}) {
-            color_line($ctx, 'yellow', "KSK keytag=%d uses disallowed algorithm %d(%s)", $ksk->keytag, $algo_num, $algo_str);
-        }
+        color_line($ctx, 'green', "KSK keytag=%d algo=%d(%s): DS published", $ksk->keytag, $algo_num, $algo_str)
+            if !warn_error($ctx, !(exists $ksks_in_ds{$ksk->keytag}), "KSK keytag=%d algo=%d(%s): no matching DS published", $ksk->keytag, $algo_num, $algo_str);
+        warn_error($ctx, !$allowed_alg->{$algo_num}, "KSK keytag=%d uses disallowed algorithm %d(%s)", $ksk->keytag, $algo_num, $algo_str);
     }
     $data->{_dnskey_by_tag} = \%dnskey_by_tag;
     $data->{_ksks_in_ds}    = \%ksks_in_ds;
+    $ok = 0 unless %ksks_in_ds;  # Erreur seulement si aucune KSK n'est liée à un DS
 
     # Chaque DS parent doit avoir une DNSKEY correspondante
+    my $one_ds_ok = 0;
     for my $ds (@$ds_rrs) {
         my $algo_num = $ds->algorithm;
         my $algo_str = $ds->algorithm('MNEMONIC');
-        if (exists $ksks_in_ds{$ds->keytag}) {
-            debug($ctx, "DS keytag=%d algo=%d(%s): matching DNSKEY found", $ds->keytag, $algo_num, $algo_str);
-        } else {
-            color_line($ctx, 'yellow', "DS keytag=%d algo=%d(%s): no matching DNSKEY in zone", $ds->keytag, $algo_num, $algo_str);
-            $ok = 0;
-        }
+        next if warn_error($ctx, !(exists $ksks_in_ds{$ds->keytag}), "DS keytag=%d algo=%d(%s): no matching DNSKEY in zone", $ds->keytag, $algo_num, $algo_str);
+        $one_ds_ok = 1;
+        debug($ctx, "DS keytag=%d algo=%d(%s): matching DNSKEY found", $ds->keytag, $algo_num, $algo_str);
     }
+    $ok = 0 unless $one_ds_ok;
 
     # On fait le test a la fin car on a besoin de peupler data
     $ok = 0 unless check_rrsig_on_rrset($ctx, 'DNSKEY', $data->{dnskey_packet}, $data->{dnskey_rrs}, $data, 1);

@@ -29,9 +29,7 @@ When a mismatch is detected, the daemon submits an update to the provider
 and polls until the operation completes.
 
 CDNSKEY records are preferred over CDS when both are present.
-DNS responses must be DNSSEC-validated (AD flag set) when possible.
-If no resolver returns AD for CDS/CDNSKEY queries, the daemon falls back
-to a local cryptographic chain validation (DS from parent -> DNSKEY -> CDS/CDNSKEY).
+DNS responses must be DNSSEC-validated (AD flag set).
 
 # OPTIONS
 
