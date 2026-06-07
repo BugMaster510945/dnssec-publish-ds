@@ -213,7 +213,7 @@ sub collect_zone_names {
     $xymongrep = "$ENV{XYMONHOME}/bin/xymongrep" if defined $ENV{XYMONHOME} && $ENV{XYMONHOME} ne q{};
     die sprintf('xymongrep not executable: %s', $xymongrep) if !-x $xymongrep;
 
-    open my $fh, '-|', $xymongrep, 'dnssec', 'dnssec='
+    open my $fh, '-|', $xymongrep, 'dnssec', 'dnssec=*'
         or die sprintf('cannot run xymongrep (%s): %s', $xymongrep, $!);
 
     while (my $line = <$fh>) {
@@ -315,12 +315,12 @@ sub run_zone_checks {
             cache     => 1,
         };
     } else {
-        my ($parent_ips, $parent_ips_err) = discover_parent_ns($ctx, $parent_zone);
+        my ($parent_ns_list, $parent_ips_err) = discover_parent_ns($ctx, $parent_zone);
         return if( check_error($ctx, $parent_ips_err, "Parent NS discovery failed: %s", $parent_ips_err) );
-        debug($ctx, "Parent NS: %d IP(s)", scalar @$parent_ips);
+        debug($ctx, "Parent NS: %d server(s)", scalar @$parent_ns_list);
 
         # Fetch delegation from parent and allow it to populate $ctx->{zone_cache}
-        my ($delegation, $delegation_err) = fetch_delegation_from_parent($ctx, $parent_ips);
+        my ($delegation, $delegation_err) = fetch_delegation_from_parent($ctx, $parent_ns_list);
         return if( check_error($ctx, $delegation_err, "Delegation query failed: %s", $delegation_err) );
         return if( check_error($ctx, !@{$delegation->{ds_rrs}}, "No DS at parent zone (%s): zone not in DNSSEC chain", $parent_zone) );
         $ctx->{parent_delegation} = $delegation;
@@ -552,69 +552,74 @@ sub discover_parent_ns {
         push @{ $additional_ips{ lc($rr->name) =~ s/\.+$//r } }, $rr->address;
     }
 
-    # Collect all parent NS IPs (additional first, then fallback resolve)
-    my @all_ips = map {
-        my $h = lc($_->nsdname) =~ s/\.+$//r;
-        @{ $additional_ips{$h} || resolve_host_ips($ctx, $ctx->{recursive}, $h) }
+    # Collect parent NS as {hostname, ips} pairs (additional first, then fallback resolve)
+    my @parent_ns = map {
+        my $h = lc($_->nsdname);
+        my @ips = @{ $additional_ips{$h} || resolve_host_ips($ctx, $ctx->{recursive}, $h) };
+        { hostname => $h, ips => \@ips };
     } @$ns_rrs;
 
-    return \@all_ips;
+    return \@parent_ns;
 }
 
 sub fetch_delegation_from_parent {
-    my ($ctx, $parent_ips) = @_;
+    my ($ctx, $parent_ns_list) = @_;
 
-    my $resolver = build_authoritative_resolver($ctx, $parent_ips, $ctx->{parent_zone});
+    # Try each parent NS in order; use per-NS resolver so TSIG is applied when configured.
+    my $last_err;
+    for my $parent_ns (@$parent_ns_list) {
+        next unless @{ $parent_ns->{ips} };
+        my $resolver = build_authoritative_resolver($ctx, $parent_ns->{ips}, $parent_ns->{hostname});
 
-    # NS delegation: check answer then authority section
-    my ($ds_packet, $ds_rrs, $ds_err);
-    my ($ns_packet, $ns_rrs, $ns_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'NS');
-    return (undef, $ns_err) if $ns_err;    
+        # NS delegation: check answer then authority section
+        my ($ns_packet, $ns_rrs, $ns_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'NS');
+        do { $last_err=$ns_err; next } if $ns_err;
 
-    my @ns_rrs = grep { $_->type eq 'NS' } ($ns_packet->answer, $ns_packet->authority);
-    return (undef, "No NS delegation records found for $ctx->{zone}") if (!@ns_rrs);
+        my @ns_rrs = grep { $_->type eq 'NS'} ($ns_packet->answer, $ns_packet->authority);
+        return (undef, "No NS delegation records found for $ctx->{zone} on $parent_ns->{hostname}") if(!@ns_rrs);
 
-    # Keep all additional IPs in hints_map; glue_map only marks in-zone NS.
-    my (%glue_map, %hints_map);
-    for my $rr ($ns_packet->additional) {
-        next unless $rr->type eq 'A' || $rr->type eq 'AAAA';
-        my $owner = lc($rr->name);
-        push @{ $hints_map{$owner} }, $rr->address;
-        if (is_in_zone($owner, $ctx->{zone})) {
-            push @{ $glue_map{$owner} }, $rr->address;
+        # Keep all additional IPs in hints_map; glue_map only marks in-zone NS.
+        my (%glue_map, %hints_map);
+        for my $rr ($ns_packet->additional) {
+            next unless $rr->type eq 'A' || $rr->type eq 'AAAA';
+            my $owner = lc($rr->name);
+            push @{ $hints_map{$owner} }, $rr->address;
+            push @{ $glue_map{$owner} }, $rr->address if (is_in_zone($owner, $ctx->{zone}));
         }
+
+        # Limit DNS request if parent provide directly DS.
+        my ($ds_packet, $ds_rrs, $ds_err);
+        my @ds_rrs = grep { $_->type eq 'DS' } ($ns_packet->answer, $ns_packet->authority);
+        if( !@ds_rrs ) {
+            # DS records from parent
+            ($ds_packet, $ds_rrs, $ds_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'DS');
+            return (undef, $ds_err) if $ds_err;
+        }
+
+        # Prepare return structure
+        my $ds_list_ref = $ds_rrs // \@ds_rrs;
+
+        # Compute a conservative min TTL from delegation NS and additional records
+        my $min_ttl = min(map { $_->ttl } (@ns_rrs, grep { $_->type =~ /^A(?:AAA)?$/ } $ns_packet->additional));
+        my $expiry = time() + ($min_ttl || $ctx->{cfg}->{cache_default_ttl} || 3600);
+
+        # Populate zone-local cache in context (serialized as strings)
+        $ctx->{zone_cache} = {
+            ns_rrs  => [ map { $_->string } @ns_rrs ],
+            ds_rrs  => [ map { $_->string } @{ $ds_list_ref || [] } ],
+            glue_map  => \%glue_map,
+            hints_map => \%hints_map,
+            expiry => $expiry,
+        };
+
+        return ({
+            ns_rrs    => \@ns_rrs,
+            ds_rrs    => $ds_list_ref,
+            glue_map  => \%glue_map,
+            hints_map => \%hints_map,
+        }, undef);
     }
-
-    # Limit DNS request if parent provide directly DS.
-    my @ds_rrs = grep { $_->type eq 'DS' } ($ns_packet->answer, $ns_packet->authority);
-    if( !@ds_rrs ) {
-        # DS records from parent
-        ($ds_packet, $ds_rrs, $ds_err) = query_rrset($ctx, $resolver, $ctx->{zone}, 'DS');
-        return (undef, $ds_err) if $ds_err;
-    }
-
-    # Prepare return structure
-    my $ds_list_ref = $ds_rrs // \@ds_rrs;
-
-    # Compute a conservative min TTL from delegation NS and additional records
-    my $min_ttl = min(map { $_->ttl } (@ns_rrs, grep { $_->type =~ /^A(?:AAA)?$/ } $ns_packet->additional));
-    my $expiry = time() + ($min_ttl || $ctx->{cfg}->{cache_default_ttl} || 3600);
-
-    # Populate zone-local cache in context (serialized as strings)
-    $ctx->{zone_cache} = {
-        ns_rrs  => [ map { $_->string } @ns_rrs ],
-        ds_rrs  => [ map { $_->string } @{ $ds_list_ref || [] } ],
-        glue_map  => \%glue_map,
-        hints_map => \%hints_map,
-        expiry => $expiry,
-    };
-
-    return ({
-        ns_rrs    => \@ns_rrs,
-        ds_rrs    => $ds_list_ref,
-        glue_map  => \%glue_map,
-        hints_map => \%hints_map,
-    }, undef);
+    return (undef, $last_err // "No suitable parent NS found to fetch delegation for $ctx->{zone}");
 }
 
 sub build_zone_ns_list {
@@ -1144,4 +1149,3 @@ sub run_ns_checks {
 }
 
 exit main();
-
