@@ -342,9 +342,9 @@ sub run_zone_checks {
         my $ips  = $ns->{ips} || [];
         my @defer;
 
+        next if( redwarn_error($ctx, !@$ips, "No resolved IPs for NS %s", $name) );
         bbprint($ctx, "%s (%s)", $name, join(', ', @$ips));
         push @defer, Guard->new(sub { bbprint($ctx, ""); }); # Saute une ligne
-        next if( redwarn_error($ctx, !@$ips, "No resolved IPs for NS %s", $name) );
 
         my $t0 = time();
         my ($data, $data_err) = fetch_zone_state_from_server($ctx, $name, $ips);
@@ -775,7 +775,7 @@ sub check_parent_ds_algorithms {
     my ($ctx, $ds_rrs) = @_;
     my $cache_suffix = $ctx->{parent_delegation}->{cache} ? ' (cache)' : '';
     my $allowed = $ctx->{cfg}->{allowed_algorithms_map};
-    for my $ds (@$ds_rrs) {
+    for my $ds (sort { $a->keytag <=> $b->keytag } @$ds_rrs) {
         my $algo = $ds->algorithm;
         my $algo_str = Net::DNS::RR::DNSKEY->algorithm($algo) || $algo;
         my $keytag = $ds->keytag;
@@ -825,7 +825,7 @@ sub check_rrsig_on_rrset {
     my $guard_replay  = Guard->new(sub { $buf->_replay($real_bb) unless $any_passed });
     $ctx->{bb} = $buf;
 
-    for my $rrsig (@rrsigs) {
+    for my $rrsig (sort { $a->keytag <=> $b->keytag } @rrsigs) {
         my $rrsig_ok = 1;
         my $keytag   = $rrsig->keytag;
         my $signer   = $dnskey_by_tag->{$keytag};
@@ -905,7 +905,7 @@ sub check_ds_dnskey_bidirectional {
     # Calcul mutualisé avec check_rrsig_on_rrset : stocké dans $data pour réutilisation
     my %dnskey_by_tag = map { $_->keytag => $_ } @$dnskey_rrs;
     my %ksks_in_ds;
-    for my $ksk (@ksks) {
+    for my $ksk (sort { $a->keytag <=> $b->keytag } @ksks) {
         for my $ds (@$ds_rrs) {
             my $calc = eval { Net::DNS::RR::DS->create($ksk, digtype => $ds->digtype) };
             next unless $calc;
@@ -928,7 +928,7 @@ sub check_ds_dnskey_bidirectional {
 
     # Chaque DS parent doit avoir une DNSKEY correspondante
     my $one_ds_ok = 0;
-    for my $ds (@$ds_rrs) {
+    for my $ds (sort { $a->keytag <=> $b->keytag } @$ds_rrs) {
         my $algo_num = $ds->algorithm;
         my $algo_str = $ds->algorithm('MNEMONIC');
         next if warn_error($ctx, !(exists $ksks_in_ds{$ds->keytag}), "DS keytag=%d algo=%d(%s): no matching DNSKEY in zone", $ds->keytag, $algo_num, $algo_str);
@@ -977,14 +977,14 @@ sub check_cds_cdnskey {
     my %zone_ds;  # clé => rr représentatif
     my %source;   # clé => label pour les messages d'erreur
 
-    for my $cds (@$cds_rrs) {
+    for my $cds (sort { $a->keytag <=> $b->keytag } @$cds_rrs) {
         $ok = 0 if redwarn_error($ctx, %$allowed && !$allowed->{$cds->algorithm}, "CDS keytag=%d: algorithm %d(%s) not in allowed_algorithms", $cds->keytag, $cds->algorithm, $cds->algorithm('MNEMONIC'));
         my $k = $ds_key->($cds);
         $zone_ds{$k} = $cds;
         $source{$k}  = 'CDS';
     }
 
-    for my $cdnskey (@$cdns_rrs) {
+    for my $cdnskey (sort { $a->keytag <=> $b->keytag } @$cdns_rrs) {
         $ok = 0 if redwarn_error($ctx, %$allowed && !$allowed->{$cdnskey->algorithm}, "CDNSKEY keytag=%d: algorithm %d(%s) not in allowed_algorithms", $cdnskey->keytag, $cdnskey->algorithm, $cdnskey->algorithm('MNEMONIC'));
         # Convertir en DS pour chaque digtype présent chez le parent
         my %seen_dig;
@@ -1005,13 +1005,13 @@ sub check_cds_cdnskey {
     if (!@extra && !@missing) {
         color_line($ctx, 'green', "CDS/CDNSKEY set matches parent DS (%d record(s))", scalar keys %zone_ds);
     } else {
-        for my $k (@extra) {
+        for my $k (sort { $a->keytag <=> $b->keytag } @extra) {
             my $r = $zone_ds{$k};
             color_line($ctx, 'yellow', "%s keytag=%d algo=%d digtype=%d: not in parent DS",
                 $source{$k}, $r->keytag, $r->algorithm, $r->digtype);
             $ok = 0;
         }
-        for my $k (@missing) {
+        for my $k (sort { $a->keytag <=> $b->keytag } @missing) {
             my $r = $ds_set{$k};
             color_line($ctx, 'yellow', "parent DS keytag=%d algo=%d digtype=%d: not covered by CDS/CDNSKEY",
                 $r->keytag, $r->algorithm, $r->digtype);
@@ -1085,8 +1085,8 @@ sub check_ns_set_vs_parent {
         return $ok;
     }
 
-    color_line($ctx, 'yellow', "NS in parent but not in zone: %s", join(', ', @only_parent)) if (@only_parent);
-    color_line($ctx, 'yellow', "NS in zone but not in parent: %s", join(', ', @only_server)) if (@only_server);
+    color_line($ctx, 'yellow', "NS in parent but not in zone: %s", join(', ', sort @only_parent)) if (@only_parent);
+    color_line($ctx, 'yellow', "NS in zone but not in parent: %s", join(', ', sort @only_server)) if (@only_server);
 
     return 0;
 }
