@@ -1005,13 +1005,13 @@ sub check_cds_cdnskey {
     if (!@extra && !@missing) {
         color_line($ctx, 'green', "CDS/CDNSKEY set matches parent DS (%d record(s))", scalar keys %zone_ds);
     } else {
-        for my $k (sort { $a->keytag <=> $b->keytag } @extra) {
+        for my $k (sort @extra) {
             my $r = $zone_ds{$k};
             color_line($ctx, 'yellow', "%s keytag=%d algo=%d digtype=%d: not in parent DS",
                 $source{$k}, $r->keytag, $r->algorithm, $r->digtype);
             $ok = 0;
         }
-        for my $k (sort { $a->keytag <=> $b->keytag } @missing) {
+        for my $k (sort @missing) {
             my $r = $ds_set{$k};
             color_line($ctx, 'yellow', "parent DS keytag=%d algo=%d digtype=%d: not covered by CDS/CDNSKEY",
                 $r->keytag, $r->algorithm, $r->digtype);
