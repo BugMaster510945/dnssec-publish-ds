@@ -21,39 +21,36 @@ func (g *RFC2136Group) Capabilities() plugin.Capabilities {
 func (g *RFC2136Group) Update(ctx context.Context, req plugin.UpdateRequest) (plugin.UpdateResult, error) {
 	zone := dns.Fqdn(req.Zone)
 
-	// Step 1: query actual current state on the target server.
-	// The target server may differ from the resolvers used by the core.
+	// Step 1: query current DS records on the target server.
 	currentDS, err := g.queryCurrentDS(ctx, zone)
 	if err != nil {
 		return plugin.UpdateResult{}, fmt.Errorf("%s: querying current DS for %s: %w", pluginName, zone, err)
 	}
 
-	// Step 2: skip no-ops — add only if absent on server, remove only if present.
+	// Step 2: compute the delta; bail out early if nothing to do.
 	toAdd, toRemove := filterDelta(currentDS, req)
-
 	if len(toAdd) == 0 && len(toRemove) == 0 {
 		g.logger().Info("rfc2136: zone already up to date, skipping update", "zone", zone)
 		return plugin.UpdateResult{}, nil
 	}
 
+	// Step 3: determine the authoritative parent zone and TTL via a SOA query.
+	parent, ttl, err := g.resolveParentSOA(ctx, zone)
+	if err != nil {
+		return plugin.UpdateResult{}, fmt.Errorf("%s: resolving parent zone for %s: %w", pluginName, zone, err)
+	}
+
 	g.logger().Info("rfc2136: updating DS records",
 		"zone", zone,
+		"parent_zone", parent,
 		"to_add", len(toAdd),
 		"to_remove", len(toRemove),
 	)
 
-	// Step 3: determine TTL (config → SOA → hardcoded default).
-	ttl, err := g.resolveTTL(ctx, zone)
-	if err != nil {
-		g.logger().Warn("rfc2136: failed to resolve TTL from SOA, using default",
-			"zone", zone, "error", err, "default_ttl", defaultTTL,
-		)
-		ttl = defaultTTL
-	}
-
-	// Step 4: build the DNS UPDATE message.
+	// Step 4: build the DNS UPDATE message targeting the parent zone.
+	// The RR owner names still use the child zone FQDN (correct for DS records).
 	msg := new(dns.Msg)
-	msg.SetUpdate(zone)
+	msg.SetUpdate(parent)
 
 	if len(toAdd) > 0 {
 		rrs := make([]dns.RR, 0, len(toAdd))
@@ -113,29 +110,46 @@ func (g *RFC2136Group) queryCurrentDS(ctx context.Context, zone string) ([]*dns.
 	return helpers.ExtractRR[*dns.DS](resp.Answer), nil
 }
 
-// resolveTTL returns the configured per-group TTL, or falls back to the SOA
-// record TTL queried from the target server, or the hardcoded default.
-func (g *RFC2136Group) resolveTTL(ctx context.Context, zone string) (uint32, error) {
-	if g.ttl != nil {
-		return *g.ttl, nil
-	}
-
+// resolveParentSOA queries the target server for the SOA of parentZone(zone)
+// (zone with its leftmost label stripped). The server returns the SOA either
+// in the ANSWER section (if it owns that exact zone) or in the AUTHORITY
+// section (for a higher-level authoritative zone). The SOA owner name is the
+// zone to target in the DNS UPDATE, and its Minttl is used as the DS TTL
+// (unless overridden by g.ttl).
+func (g *RFC2136Group) resolveParentSOA(ctx context.Context, zone string) (parent string, ttl uint32, err error) {
+	candidate := parentZone(zone)
 	msg := new(dns.Msg)
-	msg.SetQuestion(zone, dns.TypeSOA)
+	msg.SetQuestion(candidate, dns.TypeSOA)
 	msg.RecursionDesired = false
 
 	resp, err := g.exchange(ctx, msg)
 	if err != nil {
-		return defaultTTL, fmt.Errorf("SOA query: %w", err)
+		return "", 0, fmt.Errorf("SOA query for %s: %w", candidate, err)
 	}
 
-	for _, rr := range resp.Answer {
+	for _, rr := range append(resp.Answer, resp.Ns...) {
 		if soa, ok := rr.(*dns.SOA); ok {
-			return soa.Minttl, nil
+			ttl := soa.Minttl
+			if g.ttl != nil {
+				ttl = *g.ttl
+			}
+			g.logger().Debug("rfc2136: resolved authoritative parent zone via SOA",
+				"zone", zone, "parent", soa.Hdr.Name, "ttl", ttl)
+			return soa.Hdr.Name, ttl, nil
 		}
 	}
 
-	return defaultTTL, fmt.Errorf("SOA record not found in response for %s", zone)
+	return "", 0, fmt.Errorf("no SOA found for %s", candidate)
+}
+
+// parentZone returns the immediate parent of an FQDN by stripping the leftmost label.
+// Examples: "example.fr." -> "fr.", "sub.example.com." -> "example.com.", "fr." -> "."
+func parentZone(zone string) string {
+	idx := strings.Index(zone, ".")
+	if idx < 0 || idx == len(zone)-1 {
+		return "."
+	}
+	return zone[idx+1:]
 }
 
 // filterDelta filters the engine's delta against the server's actual state:
