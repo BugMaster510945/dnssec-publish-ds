@@ -34,6 +34,12 @@
 # Way to determine parent zone name for a given zone
 # zone_parent_strip_labels: 1
 
+# RRSIG renewal thresholds: yellow:red
+# zone_rrsig_delay: "5d:1d"
+
+# DS update/propagation thresholds during rollover: yellow:red
+# zone_rollover_ds_propagation_delay: "7d:15d"
+
 # Server specific settings (reserved for TSIG/SIG(0) support).
 # Keys are server name or "default".
 # server_options:

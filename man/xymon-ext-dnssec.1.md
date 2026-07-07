@@ -176,6 +176,28 @@ They can be overridden on a per-zone basis in *hosts.cfg*
     set this to **2** to reach *example.com* instead of *bar.example.com*.
     Default: **1**
 
+**zone_rrsig_delay** *WARN*:*RED*
+
+:   Default RRSIG renewal thresholds, applied on the valid signature with the
+    farthest expiration date for each RRset.
+    If remaining validity is below *WARN*, the probe emits yellow.
+    If remaining validity is below *RED*, the probe emits red.
+    Partial values are supported:
+    * **36:24** means warn=36s, red=24s
+    * **36** means warn=36s, red unchanged
+    * **:24** means warn unchanged, red=24s
+    Duration suffixes: **s**, **m**, **h**, **d**.
+    Default: **5d:1d**
+
+**zone_rollover_ds_propagation_delay** *WARN*:*RED*
+
+:   Default thresholds for DS update/propagation delay during rollover
+    transitions (for temporal DS/CDS/CDNSKEY consistency checks).
+    If age is above *WARN*, the probe emits yellow.
+    If age is above *RED*, the probe emits red.
+    Format and partial values are identical to **zone_rrsig_delay**.
+    Default: **7d:15d**
+
 ### **Per-server options**
 
 **server_options** *MAP*
@@ -235,6 +257,7 @@ allowed_algorithms:
 zone_warn_if_no_nsec3: true
 zone_require_permanent_cds_cdnskey: true
 zone_parent_strip_labels: 1
+zone_rollover_ds_propagation_delay: 7d:15d
 
 server_options:
   ns1.internal.example.com:
@@ -293,6 +316,18 @@ Per-zone options can be appended after **dnssec=**, as a comma-separated list of
     **nsec** or **nsec:true** suppresses the NSEC3PARAM warning.
     **nsec:false** is equivalent to **nsec3:true**.
 
+**rrsig_delay**:*WARN*:*RED*
+
+:   Override **zone_rrsig_delay** for this zone.
+    Uses the same format and partial-value rules as the global setting.
+    Examples: **rrsig_delay:3d:12h**, **rrsig_delay:36**, **rrsig_delay::24h**.
+
+**rollover_ds_propagation_delay**:*WARN*:*RED*
+
+:   Override **zone_rollover_ds_propagation_delay** for this zone.
+    Uses the same format and partial-value rules as **rrsig_delay**.
+    Examples: **rollover_ds_propagation_delay:7d:15d**, **rollover_ds_propagation_delay:10d**.
+
 ### **Example hosts.cfg entries**
 
 ```
@@ -307,6 +342,12 @@ Per-zone options can be appended after **dnssec=**, as a comma-separated list of
 
 # Zone using NSEC instead of NSEC3
 1.2.3.4  legacy.org             # dnssec=nsec
+
+# Zone-specific RRSIG renewal thresholds
+1.2.3.4  strict.example          # dnssec=rrsig_delay:3d:12h
+
+# Zone-specific rollover temporal thresholds
+1.2.3.4  rollover.example        # dnssec=rollover_ds_propagation_delay:7d:15d
 ```
 
 # EXIT STATUS

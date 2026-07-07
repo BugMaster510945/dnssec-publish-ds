@@ -1,4 +1,5 @@
 xymon/server/ext/xymon-ext-dnssec usr/lib/xymon/server/ext/
+xymon/server/ext/XymonDNSSEC/*.pm usr/lib/xymon/server/ext/XymonDNSSEC/
 xymon/server/etc/xymon-ext-dnssec.cfg etc/xymon/tasks.d/
 xymon/server/etc/graphs.d/xymon-ext-dnssec.cfg etc/xymon/graphs.d/
 xymon/server/etc/xymonserver.d/xymon-ext-dnssec.cfg etc/xymon/xymonserver.d/
