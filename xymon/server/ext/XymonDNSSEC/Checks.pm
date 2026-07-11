@@ -57,8 +57,6 @@ sub run_zone_checks {
         delete $ctx->{zone_status}->{$name} unless $active_ns{$name};
     }
 
-    # my $ns_passed = 0;
-    # my $ns_total  = scalar @{$ns_list};
     $ctx->{ns_keytag_collection} = { by_ns => {}, cds => {}, cdnskey => {}, dnskey => {}};
        
     # --- Phase 6: Advanced tests on each NS ---
@@ -113,9 +111,6 @@ sub run_zone_checks {
     # --- Post-Phase 6: Check consistency across all NS ---
     check_dnskey_cds_cdnskey_consistency_across_ns($ctx);
     
-    # Summary: x/y DNS servers fully compliant (color decided in one expression)
-    # color_line($ctx, $ns_passed == 0 ? 'red' : ($ns_passed == $ns_total ? 'green' : 'yellow'),
-    #     "%d/%d DNS servers fully compliant", $ns_passed, $ns_total);
     bbprint($ctx, ""); # Saute une ligne    
 }
 
@@ -190,9 +185,9 @@ sub populate_ns_keytag_collection {
         # and build type flags for by_ns index
         $ctx->{ns_keytag_collection}->{by_ns}->{$ns_name}->{$composite_key} //= {};
         foreach my $type (qw(cds cdnskey dnskey)) {
-            my $overry_type = $type eq 'dnskey' ? 'all_dnskey' : $type;
+            my $override_type = $type eq 'dnskey' ? 'all_dnskey' : $type;
             $ctx->{ns_keytag_collection}->{by_ns}->{$ns_name}->{$composite_key}->{$type} = 0;
-            if ($entry->{$overry_type}) {
+            if ($entry->{$override_type}) {
                 $ctx->{ns_keytag_collection}->{$type}->{$composite_key} = $newentry;
                 $ctx->{ns_keytag_collection}->{by_ns}->{$ns_name}->{$composite_key}->{$type} = 1;
             }
@@ -348,7 +343,6 @@ sub tidy_status {
     }
 }
 
-
 sub _age_to_color {
     my ($age, $thresholds, $colors) = @_;
 
@@ -372,7 +366,7 @@ sub _dnskey_entry_id {
 }
 
 sub check_parent_ds_algorithms {
-    my ($ctx, $ds_rrs) = @_;
+    my ($ctx) = @_;
     my @ds_rrs = @{$ctx->{parent_delegation}->{ds_rrs}};
     my $cache_suffix = $ctx->{parent_delegation}->{cache} ? ' (cache)' : '';
     my $allowed = $ctx->{cfg}->{allowed_algorithms_map};
@@ -477,7 +471,7 @@ sub check_glue_coherence {
     my $ok = 1;
 
     if (!%$glue_map) {
-        color_line($ctx, 'green', "No glue entries in parent delegation");
+        color_line($ctx, 'clear', "No glue entries in parent delegation");
         return $ok;
     }
 

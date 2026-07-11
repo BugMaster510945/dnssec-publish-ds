@@ -1,0 +1,33 @@
+name: Create GitHub Release on tag
+
+"on":
+    push:
+        tags:
+            - "*.*.*"
+    workflow_dispatch:
+
+permissions:
+    contents: write
+
+jobs:
+    create-release:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Validate tag format x.y.z
+              run: |
+                  set -euo pipefail
+                  tag="${GITHUB_REF_NAME}"
+                  if [[ ! "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    echo "Invalid tag format: $tag (expected x.y.z)" >&2
+                    exit 1
+                  fi
+
+            - name: Create or update release
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: ${{ github.ref_name }}
+                  name: Release ${{ github.ref_name }}
+                  generate_release_notes: true
+                  draft: false
+                  prerelease: false

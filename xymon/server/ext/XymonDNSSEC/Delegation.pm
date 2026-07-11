@@ -174,9 +174,6 @@ sub is_in_zone {
     my $h = lc($hostname);
     my $z = lc($zone_fqdn);
     return $h eq $z || $h =~ /\.\Q$z\E$/;
-
-    my ($fqdn, $zone) = @_;
-    return 0 unless defined $fqdn && defined $zone;
 }
 
 1;

@@ -1,0 +1,85 @@
+name: Build and publish Docker image
+
+on:
+  workflow_run:
+    workflows: ["Create GitHub Release on tag"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  docker:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # GitHub-hosted runners support ubuntu/windows/macos.
+    # For Debian specifically, use a self-hosted runner labeled for Debian.
+    # Variante Debian self-hosted:
+    # runs-on: [self-hosted, linux, debian]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Compute lowercase image name
+        id: prep
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+            tag="$(git tag --points-at "${{ github.event.workflow_run.head_sha }}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)"
+            if [[ -z "$tag" ]]; then
+              echo "No x.y.z tag found for SHA ${{ github.event.workflow_run.head_sha }}" >&2
+              exit 1
+            fi
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=manual-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ steps.prep.outputs.image }}:${{ steps.prep.outputs.tag }}
+            ${{ steps.prep.outputs.image }}:latest
+
+      - name: Create release asset with image digest
+        if: ${{ steps.prep.outputs.is_release == 'true' }}
+        run: |
+          {
+            echo "Image: ${{ steps.prep.outputs.image }}"
+            echo "Tag: ${{ steps.prep.outputs.tag }}"
+            echo "Digest: ${{ steps.build.outputs.digest }}"
+            echo "Pull (immutable): docker pull ${{ steps.prep.outputs.image }}@${{ steps.build.outputs.digest }}"
+          } > ghcr-image.txt
+
+      - name: Attach Docker image reference to release
+        if: ${{ steps.prep.outputs.is_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.prep.outputs.tag }}
+          files: ghcr-image.txt

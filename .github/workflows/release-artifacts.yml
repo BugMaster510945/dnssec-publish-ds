@@ -1,0 +1,210 @@
+name: Build Release Artifacts
+
+on:
+  workflow_run:
+    workflows: ["Create GitHub Release on tag"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-go:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            artifact_name: go-binaries-linux
+            platforms: linux/amd64 linux/arm64
+          - runner: macos-latest
+            artifact_name: go-binaries-macos
+            platforms: darwin/amd64 darwin/arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build multi-arch Go binaries
+        run: |
+          mkdir -p dist
+          for platform in ${{ matrix.platforms }}; do
+            goos="${platform%/*}"
+            goarch="${platform#*/}"
+            out="dist/dnssec-publish-ds-${goos}-${goarch}"
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+              go build -trimpath -o "${out}" .
+          done
+
+      - name: Upload Go binaries artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-debian-trixie:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve release tag
+        id: reltag
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+            tag="$(git tag --points-at "${{ github.event.workflow_run.head_sha }}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)"
+            if [[ -z "$tag" ]]; then
+              echo "No x.y.z tag found for SHA ${{ github.event.workflow_run.head_sha }}" >&2
+              exit 1
+            fi
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU for multi-arch containers
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build Debian package in Debian trixie container
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/release-assets/${{ matrix.arch }}"
+
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            -e GITHUB_EVENT_NAME \
+            -e RELEASE_TAG="${{ steps.reltag.outputs.tag }}" \
+            -e GITHUB_ACTOR \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            debian:trixie \
+            bash -lc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              export DEBFULLNAME="${GITHUB_ACTOR}"
+              export DEBEMAIL="${GITHUB_ACTOR}@users.noreply.github.com"
+
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential ca-certificates git make dpkg-dev devscripts equivs fakeroot
+
+              rm -rf /tmp/src
+              mkdir -p /tmp/src
+              cp -a /workspace/. /tmp/src/
+              cd /tmp/src
+
+              source_name="$(sed -n "s/^Source:[[:space:]]*//p" debian/control | head -n 1)"
+
+              mk-build-deps \
+                --install --remove \
+                --tool "apt-get -y --no-install-recommends" \
+                debian/control
+
+              if [[ -n "${RELEASE_TAG:-}" ]]; then
+                raw="${RELEASE_TAG}"
+                deb_version="${raw}-1"
+                changelog_msg="Release ${RELEASE_TAG}"
+              else
+                sha="$(git rev-parse --short HEAD)"
+                ts="$(date -u +%Y%m%d%H%M%S)"
+                deb_version="0.0.0~git${ts}.${sha}-1"
+                changelog_msg="Snapshot ${sha}"
+              fi
+
+              rm -f debian/changelog
+              dch --no-conf --create \
+                --package "${source_name}" \
+                --distribution trixie \
+                --newversion "${deb_version}" \
+                "${changelog_msg}"
+
+              dpkg-buildpackage -us -uc -b
+              cp /tmp/*.deb "/workspace/release-assets/${{ matrix.arch }}/"
+            '
+
+      - name: Upload Debian package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-packages-${{ matrix.arch }}
+          path: release-assets/${{ matrix.arch }}/*.deb
+          if-no-files-found: error
+
+  publish-release-assets:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    needs:
+      - build-go
+      - build-debian-trixie
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve release tag
+        id: reltag
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+            tag="$(git tag --points-at "${{ github.event.workflow_run.head_sha }}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)"
+            if [[ -z "$tag" ]]; then
+              echo "No x.y.z tag found for SHA ${{ github.event.workflow_run.head_sha }}" >&2
+              exit 1
+            fi
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=manual-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Go binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: go-binaries-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Download Debian packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-packages-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS
+
+      - name: Attach artifacts to release
+        if: ${{ steps.reltag.outputs.is_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.reltag.outputs.tag }}
+          files: |
+            release-assets/*
