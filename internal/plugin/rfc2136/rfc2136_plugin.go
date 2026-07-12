@@ -3,6 +3,7 @@ package rfc2136
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"strconv"
 
@@ -48,8 +49,8 @@ func (p *RFC2136Plugin) NewGroup(groupName string, cfg map[string]any) (plugin.G
 		if err != nil {
 			return nil, fmt.Errorf("%s: group %s: %w", pluginName, groupName, err)
 		}
-		if ttlInt <= 0 {
-			return nil, fmt.Errorf("%s: group %s: ttl must be greater than zero", pluginName, groupName)
+		if ttlInt <= 0 || ttlInt > math.MaxUint32 {
+			return nil, fmt.Errorf("%s: group %s: ttl must be between 1 and %d", pluginName, groupName, uint32(math.MaxUint32))
 		}
 		t := uint32(ttlInt)
 		ttl = &t
